@@ -1,4 +1,4 @@
-name: 内核编译-PDEM10
+name: Build Kernel (PDEM10)
 
 on:
   workflow_dispatch:
@@ -7,148 +7,86 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     env:
-      DEVICE: PDEM10
-      KERNEL_DIR: kernel
-      AK3_DIR: AnyKernel3
-      CLANG_DIR: clang-13.0.1
-      GCC64_DIR: gcc-64
-      GCC32_DIR: gcc-32
-      KERNEL_CONFIG: stock_defconfig
+      KERNEL_REPO: https://github.com/Yun-Hydrogen/Oppo_Findx2_Sukisu_Kernel.git
+      KERNEL_BRANCH: oss-t
+      CLANG_REPO: https://github.com/blacklytning/clang-13.0.1.git
+      CLANG_BRANCH: 11
+      GCC64_REPO: https://github.com/JackA1ltman/Google-GCC-Android-4.9.git
+      GCC64_BRANCH: aarch64
+      GCC32_REPO: https://github.com/JackA1ltman/Google-GCC-Android-4.9.git
+      GCC32_BRANCH: arm32
+      AK3_SOURCE: https://github.com/osm0sis/AnyKernel3.git
+      AK3_BRANCH: master
+      DEFCONFIG: stock_defconfig
       ARCH: arm64
-      SUBARCH: arm64
-      KBUILD_BUILD_USER: GitHub
-      KBUILD_BUILD_HOST: Actions
-      
+      DEVICE: PDEM10
+
     steps:
-    - name: Checkout repository
+    - name: Checkout kernel
       uses: actions/checkout@v4
       with:
-        repository: Yun-Hydrogen/Oppo_Findx2_Sukisu_Kernel
-        ref: oss-t
-        path: ${{ env.KERNEL_DIR }}
-    
-    - name: Set up Python 2
-      uses: actions/setup-python@v4
-      with:
-        python-version: '2.7'
-    
-    - name: Install dependencies
+        repository: ${{ env.KERNEL_REPO }}
+        ref: ${{ env.KERNEL_BRANCH }}
+        path: kernel
+
+    - name: Install deps & Python2
       run: |
         sudo apt-get update
-        sudo apt-get install -y \
-          build-essential \
-          gcc \
-          g++ \
-          make \
-          git \
-          ccache \
-          libssl-dev \
-          libelf-dev \
-          bc \
-          bison \
-          flex \
-          libncurses5-dev \
-          libncurses-dev \
-          liblz4-tool \
-          curl \
-          wget \
-          zip \
-          unzip \
-          rsync \
-          file \
-          python2 \
-          libpython2-dev
+        sudo apt-get install -y build-essential bc bison flex libssl-dev libncurses-dev ccache python2 git wget
         sudo ln -sf /usr/bin/python2 /usr/bin/python
-    
-    - name: Clone Clang toolchain
+
+    - name: Clone toolchains
       run: |
-        git clone --depth=1 -b 11 https://github.com/blacklytning/clang-13.0.1.git ${{ env.CLANG_DIR }}
-    
-    - name: Clone GCC 64-bit toolchain
+        git clone --depth=1 --branch $CLANG_BRANCH $CLANG_REPO clang
+        git clone --depth=1 --branch $GCC64_BRANCH $GCC64_REPO gcc64
+        git clone --depth=1 --branch $GCC32_BRANCH $GCC32_REPO gcc32
+
+    - name: Export toolchain env
       run: |
-        git clone --depth=1 -b aarch64 https://github.com/JackA1ltman/Google-GCC-Android-4.9.git ${{ env.GCC64_DIR }}
-    
-    - name: Clone GCC 32-bit toolchain
+        export PATH=$PWD/clang/bin:$PWD/gcc64/bin:$PWD/gcc32/bin:$PATH
+        echo "PATH=$PATH" >> $GITHUB_ENV
+        # 假定 gcc64 前缀 为 aarch64-linux-android- , gcc32 为 arm-linux-androideabi-
+        echo "CROSS_COMPILE_AARCH64=aarch64-linux-android-" >> $GITHUB_ENV
+        echo "CROSS_COMPILE_ARM=arm-linux-androideabi-" >> $GITHUB_ENV
+        echo "CLANG_BIN=$PWD/clang/bin/clang" >> $GITHUB_ENV
+
+    - name: Prepare build output dir
+      working-directory: kernel
       run: |
-        git clone --depth=1 -b arm32 https://github.com/JackA1ltman/Google-GCC-Android-4.9.git ${{ env.GCC32_DIR }}
-    
-    - name: Clone AnyKernel3
+        export ARCH=${{ env.ARCH }}
+        make O=out ARCH=$ARCH ${DEFCONFIG}
+
+    - name: Compile kernel with clang
+      working-directory: kernel
       run: |
-        git clone --depth=1 -b master https://github.com/osm0sis/AnyKernel3.git ${{ env.AK3_DIR }}
-    
-    - name: Configure kernel
-      working-directory: ${{ env.KERNEL_DIR }}
+        export ARCH=${{ env.ARCH }}
+        export PATH=$PWD/../clang/bin:$PWD/../gcc64/bin:$PWD/../gcc32/bin:$PATH
+        export CROSS_COMPILE=${CROSS_COMPILE_AARCH64}
+        export CC=clang
+        make -j$(nproc) O=out ARCH=$ARCH CC=clang \
+          LLVM=1 \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          HOSTCC=gcc
+
+    - name: Collect artifacts
+      working-directory: kernel
       run: |
-        make O=out ${{ env.KERNEL_CONFIG }}
-    
-    - name: Build kernel
-      working-directory: ${{ env.KERNEL_DIR }}
+        mkdir -p release
+        # 不包含 dtb/dtbo，仅拷贝内核镜像（根据内核版本可能为 Image, Image.gz, Image.gz-dtb）
+        if [ -f out/arch/arm64/boot/Image.gz ]; then cp out/arch/arm64/boot/Image.gz release/; fi
+        if [ -f out/arch/arm64/boot/Image ]; then cp out/arch/arm64/boot/Image release/; fi
+        ls -lah release
+
+    - name: AnyKernel3 package (no dtb/dtbo)
       run: |
-        PATH="${{ github.workspace }}/${{ env.CLANG_DIR }}/bin:${{ github.workspace }}/${{ env.GCC64_DIR }}/bin:${{ github.workspace }}/${{ env.GCC32_DIR }}/bin:${PATH}" \
-        make -j$(nproc --all) O=out \
-        ARCH=${{ env.ARCH }} \
-        SUBARCH=${{ env.SUBARCH }} \
-        CC=clang \
-        CLANG_TRIPLE=aarch64-linux-gnu- \
-        CROSS_COMPILE=${{ github.workspace }}/${{ env.GCC64_DIR }}/bin/aarch64-linux-android- \
-        CROSS_COMPILE_ARM32=${{ github.workspace }}/${{ env.GCC32_DIR }}/bin/arm-linux-androideabi- \
-        LD=ld.lld \
-        LDXX=ld.lld
-        
-        # Copy the compiled kernel image
-        cp out/arch/arm64/boot/Image.gz-dtb ../${{ env.AK3_DIR }}/Image.gz-dtb
-    
-    - name: Configure AnyKernel3
-      working-directory: ${{ env.AK3_DIR }}
-      run: |
-        # Remove dtb and dtbo files if they exist
-        rm -f Image.*-dtb* dtbo* dtb*
-        
-        # Configure anykernel.sh
-        sed -i "s/kernel.string=.*/kernel.string=SukisuKernel for OPPO FIND X2 by GitHub Actions/" anykernel.sh
-        sed -i "s/do.devicecheck=1/do.devicecheck=1/" anykernel.sh
-        sed -i "s/device.name1=.*/device.name1=pdem10/" anykernel.sh
-        sed -i "/device.name2=/d" anykernel.sh
-        sed -i "/device.name3=/d" anykernel.sh
-        sed -i "/device.name4=/d" anykernel.sh
-        sed -i "s/BLOCK=.*/BLOCK=auto/" anykernel.sh
-        sed -i "s/IS_SLOT_DEVICE=0/IS_SLOT_DEVICE=auto/" anykernel.sh
-        sed -i "s/RAMDISK_COMPRESSION=auto/RAMDISK_COMPRESSION=auto/" anykernel.sh
-        sed -i "s/PATCH_VBMETA_FLAG=auto/PATCH_VBMETA_FLAG=auto/" anykernel.sh
-        
-        # Add banner file (optional)
-        echo "Sukisu Kernel for OPPO FIND X2" > banner
-        echo "Built with GitHub Actions on $(date)" >> banner
-        
-        # Create version file
-        echo "SukisuKernel-PDEM10-$(date +%Y%m%d-%H%M%S)" > version
-    
-    - name: Package kernel with AnyKernel3
-      working-directory: ${{ env.AK3_DIR }}
-      run: |
-        zip -r9 ../SukisuKernel-PDEM10-$(date +%Y%m%d-%H%M%S).zip * -x .git README.md *placeholder
-        
-        # Verify the zip file
-        unzip -l ../SukisuKernel-PDEM10-$(date +%Y%m%d-%H%M%S).zip
-    
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v3
+        git clone --depth=1 --branch $AK3_BRANCH $AK3_SOURCE AnyKernel3
+        mkdir -p AnyKernel3/kernel
+        cp kernel/release/* AnyKernel3/kernel/
+        cd AnyKernel3
+        zip -r ../${{ env.DEVICE }}-kernel.zip . -x "dtb/*" "dtbo/*"
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
       with:
-        name: SukisuKernel-PDEM10
-        path: |
-          SukisuKernel-PDEM10-*.zip
-          ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image.gz-dtb
-    
-    - name: Create release (on dispatch only)
-      if: github.event_name == 'workflow_dispatch'
-      uses: softprops/action-gh-release@v1
-      with:
-        files: SukisuKernel-PDEM10-*.zip
-        tag_name: v$(date +%Y%m%d-%H%M%S)
-        name: SukisuKernel-PDEM10 v$(date +%Y%m%d-%H%M%S)
-        body: |
-          Sukisu Kernel for OPPO FIND X2 (PDEM10)
-          Built with GitHub Actions
-          - Clang 13.0.1 (branch 11)
-          - GCC 4.9 (Google Android)
-          - Kernel source: Yun-Hydrogen/Oppo_Findx2_Sukisu_Kernel (oss-t branch)
+        name: ${{ env.DEVICE }}-kernel
+        path: ${{ env.DEVICE }}-kernel.zip
