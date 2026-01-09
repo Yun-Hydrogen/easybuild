@@ -1,7 +1,6 @@
-name: Build Kernel (PDEM10)
+name: 内核编译-PDEM10
 
-on:
-  workflow_dispatch:
+on: workflow_dispatch
 
 jobs:
   build:
@@ -22,70 +21,79 @@ jobs:
       DEVICE: PDEM10
 
     steps:
-    - name: Checkout this repository
+    - name: Checkout repo
       uses: actions/checkout@v4
 
-    - name: Clone kernel source (external repo)
-      run: |
-        git clone --depth=1 --branch $KERNEL_BRANCH $KERNEL_REPO kernel
-
-    - name: Install deps & Python2
+    - name: Install deps and binutils
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential bc bison flex libssl-dev libncurses-dev ccache python2 git wget zip unzip
-        sudo ln -sf /usr/bin/python2 /usr/bin/python
+        sudo apt-get install -y build-essential bc bison flex libssl-dev libncurses-dev ccache python2 git wget zip unzip binutils
 
-    - name: Clone toolchains
-      run: |
-        git clone --depth=1 --branch $CLANG_BRANCH $CLANG_REPO clang
-        git clone --depth=1 --branch $GCC64_BRANCH $GCC64_REPO gcc64
-        git clone --depth=1 --branch $GCC32_BRANCH $GCC32_REPO gcc32
+    - name: Restore clang cache
+      uses: actions/cache@v4
+      with:
+        path: clang
+        key: clang-${{ env.CLANG_BRANCH }}-${{ runner.os }}-${{ hashFiles('**/clang/**') }}
+        restore-keys: |
+          clang-${{ env.CLANG_BRANCH }}-${{ runner.os }}-
 
-    - name: Export toolchain env
+    - name: Restore gcc64 cache
+      uses: actions/cache@v4
+      with:
+        path: gcc64
+        key: gcc64-${{ env.GCC64_BRANCH }}-${{ runner.os }}-${{ hashFiles('**/gcc64/**') }}
+        restore-keys: |
+          gcc64-${{ env.GCC64_BRANCH }}-${{ runner.os }}-
+
+    - name: Restore gcc32 cache
+      uses: actions/cache@v4
+      with:
+        path: gcc32
+        key: gcc32-${{ env.GCC32_BRANCH }}-${{ runner.os }}-${{ hashFiles('**/gcc32/**') }}
+        restore-keys: |
+          gcc32-${{ env.GCC32_BRANCH }}-${{ runner.os }}-
+
+    - name: Clone toolchains if missing
       run: |
-        echo "CLANG_DIR=$PWD/clang" >> $GITHUB_ENV
-        echo "GCC64_DIR=$PWD/gcc64" >> $GITHUB_ENV
-        echo "GCC32_DIR=$PWD/gcc32" >> $GITHUB_ENV
+        [ -d clang ] || git clone --depth=1 --branch $CLANG_BRANCH $CLANG_REPO clang
+        [ -d gcc64 ] || git clone --depth=1 --branch $GCC64_BRANCH $GCC64_REPO gcc64
+        [ -d gcc32 ] || git clone --depth=1 --branch $GCC32_BRANCH $GCC32_REPO gcc32
+
+    - name: Clone kernel source
+      run: git clone --depth=1 --branch $KERNEL_BRANCH $KERNEL_REPO kernel
+
+    - name: Export env for build (use ld.bfd)
+      run: |
         echo "PATH=$PWD/clang/bin:$PWD/gcc64/bin:$PWD/gcc32/bin:$PATH" >> $GITHUB_ENV
-        # 根据实际交叉编译器前缀调整下面两行
         echo "CROSS_COMPILE_AARCH64=aarch64-linux-android-" >> $GITHUB_ENV
         echo "CROSS_COMPILE_ARM=arm-linux-androideabi-" >> $GITHUB_ENV
+        echo "LD=ld.bfd" >> $GITHUB_ENV
+        echo "HOSTLD=ld.bfd" >> $GITHUB_ENV
 
     - name: Prepare defconfig
       working-directory: kernel
-      run: |
-        export ARCH=${{ env.ARCH }}
-        make O=out ARCH=$ARCH ${DEFCONFIG}
+      run: make O=out ARCH=$ARCH ${DEFCONFIG}
 
-    - name: Compile kernel with clang
+    - name: Build kernel (force GNU ld)
       working-directory: kernel
       run: |
-        export ARCH=${{ env.ARCH }}
         export PATH=$GITHUB_WORKSPACE/clang/bin:$GITHUB_WORKSPACE/gcc64/bin:$GITHUB_WORKSPACE/gcc32/bin:$PATH
+        export LD=ld.bfd
+        export HOSTLD=ld.bfd
         export CROSS_COMPILE=${CROSS_COMPILE_AARCH64}
-        export CC=clang
-        # 如果需要指定 clang 的完整路径或 clang++，可在此处调整
-        make -j$(nproc) O=out ARCH=$ARCH CC=clang \
-          LLVM=1 \
-          CLANG_TRIPLE=aarch64-linux-gnu- \
-          HOSTCC=gcc
+        make -j$(nproc) O=out ARCH=$ARCH CC=clang LLVM=1 HOSTCC=gcc LD=ld.bfd HOSTLD=ld.bfd
+
+    - name: Save caches (automatic on cache miss)
+      run: echo "Caches will be saved by actions/cache on job success."
 
     - name: Collect artifacts
       working-directory: kernel
       run: |
         mkdir -p release
-        # 不包含 dtb/dtbo，仅拷贝内核镜像（兼容 Image / Image.gz）
-        if [ -f out/arch/arm64/boot/Image.gz ]; then cp out/arch/arm64/boot/Image.gz release/; fi
-        if [ -f out/arch/arm64/boot/Image ]; then cp out/arch/arm64/boot/Image release/; fi
-        ls -lah release
-
-    - name: AnyKernel3 package (no dtb/dtbo)
-      run: |
+        cp out/arch/arm64/boot/Image* release/ || true
         git clone --depth=1 --branch $AK3_BRANCH $AK3_SOURCE AnyKernel3
-        mkdir -p AnyKernel3/kernel
-        cp kernel/release/* AnyKernel3/kernel/ || true
+        cp release/* AnyKernel3/kernel/ || true
         cd AnyKernel3
-        # 打包时排除 dtb/dtbo 目录（如果存在）
         zip -r ../${{ env.DEVICE }}-kernel.zip . -x "dtb/*" "dtbo/*"
 
     - name: Upload artifact
