@@ -74,6 +74,7 @@ jobs:
       - name: 设置环境变量
         run: |
           echo "PATH=$PWD/clang/bin:$PWD/gcc64/bin:$PWD/gcc32/bin:$PATH" >> $GITHUB_ENV
+          # 根据工具链实际前缀调整下面两行
           echo "CROSS_COMPILE_AARCH64=aarch64-linux-android-" >> $GITHUB_ENV
           echo "CROSS_COMPILE_ARM=arm-linux-androideabi-" >> $GITHUB_ENV
           echo "HOSTPYTHON=/usr/bin/python2" >> $GITHUB_ENV
