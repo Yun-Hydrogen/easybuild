@@ -22,17 +22,17 @@ jobs:
       DEVICE: PDEM10
 
     steps:
-    - name: Checkout kernel
+    - name: Checkout this repository
       uses: actions/checkout@v4
-      with:
-        repository: ${{ env.KERNEL_REPO }}
-        ref: ${{ env.KERNEL_BRANCH }}
-        path: kernel
+
+    - name: Clone kernel source (external repo)
+      run: |
+        git clone --depth=1 --branch $KERNEL_BRANCH $KERNEL_REPO kernel
 
     - name: Install deps & Python2
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential bc bison flex libssl-dev libncurses-dev ccache python2 git wget
+        sudo apt-get install -y build-essential bc bison flex libssl-dev libncurses-dev ccache python2 git wget zip unzip
         sudo ln -sf /usr/bin/python2 /usr/bin/python
 
     - name: Clone toolchains
@@ -43,14 +43,15 @@ jobs:
 
     - name: Export toolchain env
       run: |
-        export PATH=$PWD/clang/bin:$PWD/gcc64/bin:$PWD/gcc32/bin:$PATH
-        echo "PATH=$PATH" >> $GITHUB_ENV
-        # 假定 gcc64 前缀 为 aarch64-linux-android- , gcc32 为 arm-linux-androideabi-
+        echo "CLANG_DIR=$PWD/clang" >> $GITHUB_ENV
+        echo "GCC64_DIR=$PWD/gcc64" >> $GITHUB_ENV
+        echo "GCC32_DIR=$PWD/gcc32" >> $GITHUB_ENV
+        echo "PATH=$PWD/clang/bin:$PWD/gcc64/bin:$PWD/gcc32/bin:$PATH" >> $GITHUB_ENV
+        # 根据实际交叉编译器前缀调整下面两行
         echo "CROSS_COMPILE_AARCH64=aarch64-linux-android-" >> $GITHUB_ENV
         echo "CROSS_COMPILE_ARM=arm-linux-androideabi-" >> $GITHUB_ENV
-        echo "CLANG_BIN=$PWD/clang/bin/clang" >> $GITHUB_ENV
 
-    - name: Prepare build output dir
+    - name: Prepare defconfig
       working-directory: kernel
       run: |
         export ARCH=${{ env.ARCH }}
@@ -60,9 +61,10 @@ jobs:
       working-directory: kernel
       run: |
         export ARCH=${{ env.ARCH }}
-        export PATH=$PWD/../clang/bin:$PWD/../gcc64/bin:$PWD/../gcc32/bin:$PATH
+        export PATH=$GITHUB_WORKSPACE/clang/bin:$GITHUB_WORKSPACE/gcc64/bin:$GITHUB_WORKSPACE/gcc32/bin:$PATH
         export CROSS_COMPILE=${CROSS_COMPILE_AARCH64}
         export CC=clang
+        # 如果需要指定 clang 的完整路径或 clang++，可在此处调整
         make -j$(nproc) O=out ARCH=$ARCH CC=clang \
           LLVM=1 \
           CLANG_TRIPLE=aarch64-linux-gnu- \
@@ -72,7 +74,7 @@ jobs:
       working-directory: kernel
       run: |
         mkdir -p release
-        # 不包含 dtb/dtbo，仅拷贝内核镜像（根据内核版本可能为 Image, Image.gz, Image.gz-dtb）
+        # 不包含 dtb/dtbo，仅拷贝内核镜像（兼容 Image / Image.gz）
         if [ -f out/arch/arm64/boot/Image.gz ]; then cp out/arch/arm64/boot/Image.gz release/; fi
         if [ -f out/arch/arm64/boot/Image ]; then cp out/arch/arm64/boot/Image release/; fi
         ls -lah release
@@ -81,8 +83,9 @@ jobs:
       run: |
         git clone --depth=1 --branch $AK3_BRANCH $AK3_SOURCE AnyKernel3
         mkdir -p AnyKernel3/kernel
-        cp kernel/release/* AnyKernel3/kernel/
+        cp kernel/release/* AnyKernel3/kernel/ || true
         cd AnyKernel3
+        # 打包时排除 dtb/dtbo 目录（如果存在）
         zip -r ../${{ env.DEVICE }}-kernel.zip . -x "dtb/*" "dtbo/*"
 
     - name: Upload artifact
