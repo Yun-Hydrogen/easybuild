@@ -1,4 +1,4 @@
-name: 构建内核 PDEM10
+name: 构建内核 PDEM10 V2
 
 on:
   workflow_dispatch:
