@@ -1,103 +1,117 @@
-name: 内核编译-PDEM10
+name: 构建内核 PDEM10
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+
+env:
+  KERNEL_REPO: https://github.com/Yun-Hydrogen/Oppo_Findx2_Sukisu_Kernel.git
+  KERNEL_BRANCH: oss-t
+  CLANG_REPO: https://github.com/blacklytning/clang-13.0.1.git
+  CLANG_BRANCH: 11
+  GCC64_REPO: https://github.com/JackA1ltman/Google-GCC-Android-4.9.git
+  GCC64_BRANCH: aarch64
+  GCC32_REPO: https://github.com/JackA1ltman/Google-GCC-Android-4.9.git
+  GCC32_BRANCH: arm32
+  AK3_SOURCE: https://github.com/osm0sis/AnyKernel3.git
+  AK3_BRANCH: master
+  DEFCONFIG: stock_defconfig
+  ARCH: arm64
+  DEVICE: PDEM10
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    env:
-      KERNEL_REPO: https://github.com/Yun-Hydrogen/Oppo_Findx2_Sukisu_Kernel.git
-      KERNEL_BRANCH: oss-t
-      CLANG_REPO: https://github.com/blacklytning/clang-13.0.1.git
-      CLANG_BRANCH: 11
-      GCC64_REPO: https://github.com/JackA1ltman/Google-GCC-Android-4.9.git
-      GCC64_BRANCH: aarch64
-      GCC32_REPO: https://github.com/JackA1ltman/Google-GCC-Android-4.9.git
-      GCC32_BRANCH: arm32
-      AK3_SOURCE: https://github.com/osm0sis/AnyKernel3.git
-      AK3_BRANCH: master
-      DEFCONFIG: stock_defconfig
-      ARCH: arm64
-      DEVICE: PDEM10
-
     steps:
-    - name: Checkout repo
-      uses: actions/checkout@v4
+      - name: 检出当前仓库
+        uses: actions/checkout@v4
 
-    - name: Install deps and binutils
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential bc bison flex libssl-dev libncurses-dev ccache python2 git wget zip unzip binutils
+      - name: 安装依赖与 Python2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev libncurses-dev ccache python2 git wget zip unzip binutils
+          # 将 python 链接到 python2，确保内核脚本使用 Python2
+          sudo ln -sf /usr/bin/python2 /usr/bin/python
+          python --version
 
-    - name: Restore clang cache
-      uses: actions/cache@v4
-      with:
-        path: clang
-        key: clang-${{ env.CLANG_BRANCH }}-${{ runner.os }}-${{ hashFiles('**/clang/**') }}
-        restore-keys: |
-          clang-${{ env.CLANG_BRANCH }}-${{ runner.os }}-
+      - name: 恢复 clang 缓存
+        uses: actions/cache@v4
+        with:
+          path: clang
+          key: clang-${{ env.CLANG_BRANCH }}-${{ runner.os }}
+          restore-keys: |
+            clang-${{ env.CLANG_BRANCH }}-${{ runner.os }}-
+            clang-${{ runner.os }}-
 
-    - name: Restore gcc64 cache
-      uses: actions/cache@v4
-      with:
-        path: gcc64
-        key: gcc64-${{ env.GCC64_BRANCH }}-${{ runner.os }}-${{ hashFiles('**/gcc64/**') }}
-        restore-keys: |
-          gcc64-${{ env.GCC64_BRANCH }}-${{ runner.os }}-
+      - name: 恢复 gcc64 缓存
+        uses: actions/cache@v4
+        with:
+          path: gcc64
+          key: gcc64-${{ env.GCC64_BRANCH }}-${{ runner.os }}
+          restore-keys: |
+            gcc64-${{ env.GCC64_BRANCH }}-${{ runner.os }}-
+            gcc64-${{ runner.os }}-
 
-    - name: Restore gcc32 cache
-      uses: actions/cache@v4
-      with:
-        path: gcc32
-        key: gcc32-${{ env.GCC32_BRANCH }}-${{ runner.os }}-${{ hashFiles('**/gcc32/**') }}
-        restore-keys: |
-          gcc32-${{ env.GCC32_BRANCH }}-${{ runner.os }}-
+      - name: 恢复 gcc32 缓存
+        uses: actions/cache@v4
+        with:
+          path: gcc32
+          key: gcc32-${{ env.GCC32_BRANCH }}-${{ runner.os }}
+          restore-keys: |
+            gcc32-${{ env.GCC32_BRANCH }}-${{ runner.os }}-
+            gcc32-${{ runner.os }}-
 
-    - name: Clone toolchains if missing
-      run: |
-        [ -d clang ] || git clone --depth=1 --branch $CLANG_BRANCH $CLANG_REPO clang
-        [ -d gcc64 ] || git clone --depth=1 --branch $GCC64_BRANCH $GCC64_REPO gcc64
-        [ -d gcc32 ] || git clone --depth=1 --branch $GCC32_BRANCH $GCC32_REPO gcc32
+      - name: 克隆工具链（若缓存未命中）
+        run: |
+          [ -d clang ] || git clone --depth=1 --branch $CLANG_BRANCH $CLANG_REPO clang
+          [ -d gcc64 ] || git clone --depth=1 --branch $GCC64_BRANCH $GCC64_REPO gcc64
+          [ -d gcc32 ] || git clone --depth=1 --branch $GCC32_BRANCH $GCC32_REPO gcc32
 
-    - name: Clone kernel source
-      run: git clone --depth=1 --branch $KERNEL_BRANCH $KERNEL_REPO kernel
+      - name: 克隆内核源码
+        run: |
+          rm -rf kernel
+          git clone --depth=1 --branch $KERNEL_BRANCH $KERNEL_REPO kernel
 
-    - name: Export env for build (use ld.bfd)
-      run: |
-        echo "PATH=$PWD/clang/bin:$PWD/gcc64/bin:$PWD/gcc32/bin:$PATH" >> $GITHUB_ENV
-        echo "CROSS_COMPILE_AARCH64=aarch64-linux-android-" >> $GITHUB_ENV
-        echo "CROSS_COMPILE_ARM=arm-linux-androideabi-" >> $GITHUB_ENV
-        echo "LD=ld.bfd" >> $GITHUB_ENV
-        echo "HOSTLD=ld.bfd" >> $GITHUB_ENV
+      - name: 设置环境变量
+        run: |
+          echo "PATH=$PWD/clang/bin:$PWD/gcc64/bin:$PWD/gcc32/bin:$PATH" >> $GITHUB_ENV
+          echo "CROSS_COMPILE_AARCH64=aarch64-linux-android-" >> $GITHUB_ENV
+          echo "CROSS_COMPILE_ARM=arm-linux-androideabi-" >> $GITHUB_ENV
+          echo "HOSTPYTHON=/usr/bin/python2" >> $GITHUB_ENV
+          echo "PYTHON=/usr/bin/python2" >> $GITHUB_ENV
 
-    - name: Prepare defconfig
-      working-directory: kernel
-      run: make O=out ARCH=$ARCH ${DEFCONFIG}
+      - name: 准备 defconfig
+        working-directory: kernel
+        run: |
+          export ARCH=${{ env.ARCH }}
+          make O=out ARCH=$ARCH ${DEFCONFIG} HOSTPYTHON=/usr/bin/python2
 
-    - name: Build kernel (force GNU ld)
-      working-directory: kernel
-      run: |
-        export PATH=$GITHUB_WORKSPACE/clang/bin:$GITHUB_WORKSPACE/gcc64/bin:$GITHUB_WORKSPACE/gcc32/bin:$PATH
-        export LD=ld.bfd
-        export HOSTLD=ld.bfd
-        export CROSS_COMPILE=${CROSS_COMPILE_AARCH64}
-        make -j$(nproc) O=out ARCH=$ARCH CC=clang LLVM=1 HOSTCC=gcc LD=ld.bfd HOSTLD=ld.bfd
+      - name: 编译内核
+        working-directory: kernel
+        run: |
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$GITHUB_WORKSPACE/gcc64/bin:$GITHUB_WORKSPACE/gcc32/bin:$PATH
+          export HOSTPYTHON=/usr/bin/python2
+          export PYTHON=/usr/bin/python2
+          export CROSS_COMPILE=${CROSS_COMPILE_AARCH64}
+          make -j$(nproc) O=out ARCH=$ARCH CC=clang LLVM=1 HOSTCC=gcc HOSTPYTHON=/usr/bin/python2
 
-    - name: Save caches (automatic on cache miss)
-      run: echo "Caches will be saved by actions/cache on job success."
+      - name: 收集内核镜像
+        working-directory: kernel
+        run: |
+          mkdir -p release
+          cp out/arch/arm64/boot/Image* release/ || true
+          ls -lah release || true
 
-    - name: Collect artifacts
-      working-directory: kernel
-      run: |
-        mkdir -p release
-        cp out/arch/arm64/boot/Image* release/ || true
-        git clone --depth=1 --branch $AK3_BRANCH $AK3_SOURCE AnyKernel3
-        cp release/* AnyKernel3/kernel/ || true
-        cd AnyKernel3
-        zip -r ../${{ env.DEVICE }}-kernel.zip . -x "dtb/*" "dtbo/*"
+      - name: 使用 AnyKernel3 打包（排除 dtb/dtbo）
+        working-directory: kernel
+        run: |
+          git clone --depth=1 --branch $AK3_BRANCH $AK3_SOURCE AnyKernel3
+          mkdir -p AnyKernel3/kernel
+          cp -r release/* AnyKernel3/kernel/ || true
+          cd AnyKernel3
+          zip -r ../${{ env.DEVICE }}-kernel.zip . -x "dtb/*" "dtbo/*"
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ env.DEVICE }}-kernel
-        path: ${{ env.DEVICE }}-kernel.zip
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DEVICE }}-kernel
+          path: ${{ env.DEVICE }}-kernel.zip
