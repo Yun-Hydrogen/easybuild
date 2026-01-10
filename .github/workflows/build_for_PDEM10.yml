@@ -1,9 +1,10 @@
-name: 构建内核 PDEM10 (Clang+GCC)
+name: 构建内核 PDEM10 (Clang+GCC + 交叉 ld)
 
 on:
   workflow_dispatch:
 
 env:
+  # 请根据需要修改这些仓库与分支
   KERNEL_REPO: https://github.com/Yun-Hydrogen/Oppo_Findx2_Sukisu_Kernel.git
   KERNEL_BRANCH: oss-t
   CLANG_REPO: https://github.com/blacklytning/clang-13.0.1.git
@@ -17,19 +18,22 @@ env:
   DEFCONFIG: stock_defconfig
   ARCH: arm64
   DEVICE: PDEM10
+  # 交叉编译前缀（根据工具链实际二进制名前缀调整）
+  CROSS_COMPILE_AARCH64: aarch64-linux-android-
+  CROSS_COMPILE_ARM: arm-linux-androideabi-
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: 检出当前仓库
+      - name: 检出仓库
         uses: actions/checkout@v4
 
-      - name: 安装依赖与 Python2
+      - name: 安装依赖并配置 python2
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential bc bison flex libssl-dev libncurses-dev ccache python2 git wget zip unzip binutils
-          # 将 python 链接到 python2，确保内核脚本使用 Python2
+          # 将 /usr/bin/python 指向 python2，确保内核脚本使用 Python2
           sudo ln -sf /usr/bin/python2 /usr/bin/python
           python --version
 
@@ -62,9 +66,21 @@ jobs:
 
       - name: 克隆工具链（若缓存未命中）
         run: |
-          [ -d clang ] || git clone --depth=1 --branch $CLANG_BRANCH $CLANG_REPO clang
-          [ -d gcc64 ] || git clone --depth=1 --branch $GCC64_BRANCH $GCC64_REPO gcc64
-          [ -d gcc32 ] || git clone --depth=1 --branch $GCC32_BRANCH $GCC32_REPO gcc32
+          if [ ! -d clang ] || [ -z "$(ls -A clang 2>/dev/null)" ]; then
+            git clone --depth=1 --branch $CLANG_BRANCH $CLANG_REPO clang
+          else
+            echo "clang 已存在，跳过克隆"
+          fi
+          if [ ! -d gcc64 ] || [ -z "$(ls -A gcc64 2>/dev/null)" ]; then
+            git clone --depth=1 --branch $GCC64_BRANCH $GCC64_REPO gcc64
+          else
+            echo "gcc64 已存在，跳过克隆"
+          fi
+          if [ ! -d gcc32 ] || [ -z "$(ls -A gcc32 2>/dev/null)" ]; then
+            git clone --depth=1 --branch $GCC32_BRANCH $GCC32_REPO gcc32
+          else
+            echo "gcc32 已存在，跳过克隆"
+          fi
 
       - name: 克隆内核源码
         run: |
@@ -74,19 +90,39 @@ jobs:
       - name: 设置环境变量
         run: |
           echo "PATH=$PWD/clang/bin:$PWD/gcc64/bin:$PWD/gcc32/bin:$PATH" >> $GITHUB_ENV
-          # 根据工具链实际前缀调整下面两行
-          echo "CROSS_COMPILE_AARCH64=aarch64-linux-android-" >> $GITHUB_ENV
-          echo "CROSS_COMPILE_ARM=arm-linux-androideabi-" >> $GITHUB_ENV
+          echo "CROSS_COMPILE_AARCH64=${{ env.CROSS_COMPILE_AARCH64 }}" >> $GITHUB_ENV
+          echo "CROSS_COMPILE_ARM=${{ env.CROSS_COMPILE_ARM }}" >> $GITHUB_ENV
           echo "HOSTPYTHON=/usr/bin/python2" >> $GITHUB_ENV
           echo "PYTHON=/usr/bin/python2" >> $GITHUB_ENV
+
+      - name: 验证交叉链接器可用
+        working-directory: kernel
+        run: |
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$GITHUB_WORKSPACE/gcc64/bin:$GITHUB_WORKSPACE/gcc32/bin:$PATH
+          echo "检查交叉 ld 是否存在："
+          if command -v ${CROSS_COMPILE_AARCH64}ld >/dev/null 2>&1; then
+            ${CROSS_COMPILE_AARCH64}ld --version || true
+          else
+            echo "错误：交叉链接器 ${CROSS_COMPILE_AARCH64}ld 未找到，请确认工具链包含交叉 ld"
+            ls -la gcc64/bin || true
+            exit 1
+          fi
+          # 可选：移除系统 ld.lld，避免被内核 Makefile 自动选中（需要 sudo）
+          if [ -f /usr/bin/ld.lld ]; then
+            echo "移除 /usr/bin/ld.lld 以避免被自动选中"
+            sudo rm -f /usr/bin/ld.lld || true
+          fi
+          echo "宿主 ld 版本："
+          ld --version || true
 
       - name: 准备 defconfig
         working-directory: kernel
         run: |
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$GITHUB_WORKSPACE/gcc64/bin:$GITHUB_WORKSPACE/gcc32/bin:$PATH
           export ARCH=${{ env.ARCH }}
           make O=out ARCH=$ARCH ${DEFCONFIG} HOSTPYTHON=/usr/bin/python2
 
-      - name: 编译内核（Clang+GCC，不用LLVM lld）
+      - name: 编译内核（Clang + GCC，使用交叉 ld）
         working-directory: kernel
         run: |
           export PATH=$GITHUB_WORKSPACE/clang/bin:$GITHUB_WORKSPACE/gcc64/bin:$GITHUB_WORKSPACE/gcc32/bin:$PATH
@@ -94,14 +130,15 @@ jobs:
           export PYTHON=/usr/bin/python2
           export CROSS_COMPILE=${CROSS_COMPILE_AARCH64}
           export CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM}
-          ld --version   # 确认是 GNU ld
-          make -j$(nproc) O=out ARCH=$ARCH CC=clang HOSTCC=gcc LD=ld.bfd HOSTLD=ld.bfd HOSTPYTHON=/usr/bin/python2
+          # 使用交叉链接器 aarch64-linux-android-ld 链接目标 vmlinux/vdso
+          make -j$(nproc) O=out ARCH=$ARCH CC=clang HOSTCC=gcc LD=${CROSS_COMPILE_AARCH64}ld HOSTLD=ld.bfd HOSTPYTHON=/usr/bin/python2
 
       - name: 收集内核镜像
         working-directory: kernel
         run: |
           mkdir -p release
           cp out/arch/arm64/boot/Image* release/ || true
+          cp out/arch/arm64/boot/Image.gz* release/ || true
           ls -lah release || true
 
       - name: 使用 AnyKernel3 打包（排除 dtb/dtbo）
