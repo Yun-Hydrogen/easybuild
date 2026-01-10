@@ -1,10 +1,9 @@
-name: 构建内核 PDEM10 (Clang+GCC + 交叉 ld)
+name: 构建内核并备份原始产物 PDEM10
 
 on:
   workflow_dispatch:
 
 env:
-  # 请根据需要修改这些仓库与分支
   KERNEL_REPO: https://github.com/Yun-Hydrogen/Oppo_Findx2_Sukisu_Kernel.git
   KERNEL_BRANCH: oss-t
   CLANG_REPO: https://github.com/blacklytning/clang-13.0.1.git
@@ -18,7 +17,6 @@ env:
   DEFCONFIG: stock_defconfig
   ARCH: arm64
   DEVICE: PDEM10
-  # 交叉编译前缀（根据工具链实际二进制名前缀调整）
   CROSS_COMPILE_AARCH64: aarch64-linux-android-
   CROSS_COMPILE_ARM: arm-linux-androideabi-
 
@@ -33,7 +31,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential bc bison flex libssl-dev libncurses-dev ccache python2 git wget zip unzip binutils
-          # 将 /usr/bin/python 指向 python2，确保内核脚本使用 Python2
           sudo ln -sf /usr/bin/python2 /usr/bin/python
           python --version
 
@@ -66,21 +63,9 @@ jobs:
 
       - name: 克隆工具链（若缓存未命中）
         run: |
-          if [ ! -d clang ] || [ -z "$(ls -A clang 2>/dev/null)" ]; then
-            git clone --depth=1 --branch $CLANG_BRANCH $CLANG_REPO clang
-          else
-            echo "clang 已存在，跳过克隆"
-          fi
-          if [ ! -d gcc64 ] || [ -z "$(ls -A gcc64 2>/dev/null)" ]; then
-            git clone --depth=1 --branch $GCC64_BRANCH $GCC64_REPO gcc64
-          else
-            echo "gcc64 已存在，跳过克隆"
-          fi
-          if [ ! -d gcc32 ] || [ -z "$(ls -A gcc32 2>/dev/null)" ]; then
-            git clone --depth=1 --branch $GCC32_BRANCH $GCC32_REPO gcc32
-          else
-            echo "gcc32 已存在，跳过克隆"
-          fi
+          [ -d clang ] || git clone --depth=1 --branch $CLANG_BRANCH $CLANG_REPO clang
+          [ -d gcc64 ] || git clone --depth=1 --branch $GCC64_BRANCH $GCC64_REPO gcc64
+          [ -d gcc32 ] || git clone --depth=1 --branch $GCC32_BRANCH $GCC32_REPO gcc32
 
       - name: 克隆内核源码
         run: |
@@ -99,7 +84,6 @@ jobs:
         working-directory: kernel
         run: |
           export PATH=$GITHUB_WORKSPACE/clang/bin:$GITHUB_WORKSPACE/gcc64/bin:$GITHUB_WORKSPACE/gcc32/bin:$PATH
-          echo "检查交叉 ld 是否存在："
           if command -v ${CROSS_COMPILE_AARCH64}ld >/dev/null 2>&1; then
             ${CROSS_COMPILE_AARCH64}ld --version || true
           else
@@ -107,12 +91,9 @@ jobs:
             ls -la gcc64/bin || true
             exit 1
           fi
-          # 可选：移除系统 ld.lld，避免被内核 Makefile 自动选中（需要 sudo）
           if [ -f /usr/bin/ld.lld ]; then
-            echo "移除 /usr/bin/ld.lld 以避免被自动选中"
             sudo rm -f /usr/bin/ld.lld || true
           fi
-          echo "宿主 ld 版本："
           ld --version || true
 
       - name: 准备 defconfig
@@ -125,32 +106,67 @@ jobs:
       - name: 编译内核（Clang + GCC，使用交叉 ld）
         working-directory: kernel
         run: |
+          set -e
           export PATH=$GITHUB_WORKSPACE/clang/bin:$GITHUB_WORKSPACE/gcc64/bin:$GITHUB_WORKSPACE/gcc32/bin:$PATH
           export HOSTPYTHON=/usr/bin/python2
           export PYTHON=/usr/bin/python2
           export CROSS_COMPILE=${CROSS_COMPILE_AARCH64}
           export CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM}
-          # 使用交叉链接器 aarch64-linux-android-ld 链接目标 vmlinux/vdso
           make -j$(nproc) O=out ARCH=$ARCH CC=clang HOSTCC=gcc LD=${CROSS_COMPILE_AARCH64}ld HOSTLD=ld.bfd HOSTPYTHON=/usr/bin/python2
 
-      - name: 收集内核镜像
+      - name: 立即备份并准备原始产物（未打包）
+        if: success()
         working-directory: kernel
         run: |
-          mkdir -p release
-          cp out/arch/arm64/boot/Image* release/ || true
-          cp out/arch/arm64/boot/Image.gz* release/ || true
-          ls -lah release || true
+          set -e
+          RAW_DIR="$GITHUB_WORKSPACE/raw_artifacts"
+          mkdir -p "$RAW_DIR"
+          cp -v out/arch/arm64/boot/Image* "$RAW_DIR/" 2>/dev/null || true
+          cp -v out/arch/arm64/boot/dts/* "$RAW_DIR/" 2>/dev/null || true
+          cp -v out/arch/arm64/boot/dtbo* "$RAW_DIR/" 2>/dev/null || true
+          cp -v out/System.map "$RAW_DIR/" 2>/dev/null || true
+          if [ -d out/lib/modules ]; then
+            mkdir -p "$RAW_DIR/modules"
+            cp -r out/lib/modules/* "$RAW_DIR/modules/" || true
+          fi
+          echo "raw_artifacts 内容："
+          ls -la "$RAW_DIR" || true
 
-      - name: 使用 AnyKernel3 打包（排除 dtb/dtbo）
+      - name: 上传原始产物
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-${{ env.DEVICE }}
+          path: raw_artifacts
+
+      - name: 打包 AnyKernel3（在备份后进行）
+        if: success()
         working-directory: kernel
         run: |
+          set -e
           git clone --depth=1 --branch $AK3_BRANCH $AK3_SOURCE AnyKernel3
           mkdir -p AnyKernel3/kernel
-          cp -r release/* AnyKernel3/kernel/ || true
+          if [ -d release ] && [ "$(ls -A release 2>/dev/null)" ]; then
+            cp -r release/* AnyKernel3/kernel/ || true
+          else
+            cp -r $GITHUB_WORKSPACE/raw_artifacts/* AnyKernel3/kernel/ || true
+          fi
           cd AnyKernel3
-          zip -r ../${{ env.DEVICE }}-kernel.zip . -x "dtb/*" "dtbo/*"
+          OUT_ZIP="$GITHUB_WORKSPACE/${DEVICE}-kernel.zip"
+          zip -r "$OUT_ZIP" . -x "dtb/*" "dtbo/*"
+          echo "生成的 zip: $OUT_ZIP"
+          ls -lah "$OUT_ZIP" || true
 
-      - name: 上传构建产物
+      - name: 验证并列出根目录文件（确保 zip 存在）
+        if: success()
+        run: |
+          echo "工作区根目录文件："
+          ls -la $GITHUB_WORKSPACE || true
+          echo "查找 kernel zip："
+          find $GITHUB_WORKSPACE -maxdepth 2 -type f -name "${DEVICE}-kernel.zip" -print || true
+
+      - name: 上传打包产物
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.DEVICE }}-kernel
