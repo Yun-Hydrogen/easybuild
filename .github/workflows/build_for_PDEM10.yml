@@ -1,4 +1,4 @@
-name: 构建内核 PDEM10 V2
+name: 构建内核 PDEM10 (Clang+GCC)
 
 on:
   workflow_dispatch:
@@ -86,14 +86,16 @@ jobs:
           export ARCH=${{ env.ARCH }}
           make O=out ARCH=$ARCH ${DEFCONFIG} HOSTPYTHON=/usr/bin/python2
 
-      - name: 编译内核
+      - name: 编译内核（Clang+GCC，不用LLVM lld）
         working-directory: kernel
         run: |
           export PATH=$GITHUB_WORKSPACE/clang/bin:$GITHUB_WORKSPACE/gcc64/bin:$GITHUB_WORKSPACE/gcc32/bin:$PATH
           export HOSTPYTHON=/usr/bin/python2
           export PYTHON=/usr/bin/python2
           export CROSS_COMPILE=${CROSS_COMPILE_AARCH64}
-          make -j$(nproc) O=out ARCH=$ARCH CC=clang LLVM=1 HOSTCC=gcc HOSTPYTHON=/usr/bin/python2
+          export CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM}
+          ld --version   # 确认是 GNU ld
+          make -j$(nproc) O=out ARCH=$ARCH CC=clang HOSTCC=gcc LD=ld.bfd HOSTLD=ld.bfd HOSTPYTHON=/usr/bin/python2
 
       - name: 收集内核镜像
         working-directory: kernel
