@@ -1,10 +1,9 @@
-name: 构建内核并集成 SukiSU (Manual hook + SUSFS 可选)
+name: 构建内核并集成 SukiSU 修复 techpack Makefile
 
 on:
   workflow_dispatch:
 
 env:
-  # 源码与工具链（按需修改）
   KERNEL_REPO: https://github.com/Yun-Hydrogen/Oppo_Findx2_Sukisu_Kernel.git
   KERNEL_BRANCH: oss-t
   CLANG_REPO: https://github.com/blacklytning/clang-13.0.1.git
@@ -15,11 +14,7 @@ env:
   GCC32_BRANCH: arm32
   AK3_SOURCE: https://github.com/osm0sis/AnyKernel3.git
   AK3_BRANCH: master
-
-  # SukiSU 集成模式：选择 "nongki" 或 "susfs-<branch>"（若不启用 SUSFS 用 nongki）
   SUKISU_MODE: nongki
-
-  # 内核构建配置
   DEFCONFIG: stock_defconfig
   ARCH: arm64
   DEVICE: PDEM10
@@ -53,28 +48,6 @@ jobs:
           git clone --depth=1 --branch $KERNEL_BRANCH $KERNEL_REPO kernel
           ls -la kernel
 
-      - name: 确保内核源码干净（mrproper / git clean）
-        working-directory: kernel
-        run: |
-          set -e
-          echo "备份 .config（如存在）"
-          if [ -f .config ]; then
-            cp .config /tmp/config.backup || true
-          fi
-          # 优先清理 O=out 构建残留
-          make O=out mrproper || true
-          # 保守的 git 清理（CI 中通常安全）
-          git reset --hard || true
-          git clean -fdx || true
-          # 恢复 .config 并生成 out/.config（如有备份）
-          if [ -f /tmp/config.backup ]; then
-            mv /tmp/config.backup .config || true
-            make O=out olddefconfig || true
-          fi
-          echo "清理完成"
-          git status --porcelain || true
-          ls -la || true
-
       - name: 设置环境变量
         run: |
           echo "PATH=$PWD/clang/bin:$PWD/gcc64/bin:$PWD/gcc32/bin:$PATH" >> $GITHUB_ENV
@@ -83,40 +56,82 @@ jobs:
           echo "HOSTPYTHON=/usr/bin/python2" >> $GITHUB_ENV
           echo "PYTHON=/usr/bin/python2" >> $GITHUB_ENV
 
+      - name: 捕获并记录准备与修补日志
+        working-directory: kernel
+        run: |
+          set -e
+          LOG="$GITHUB_WORKSPACE/kernel/setup.log"
+          echo "=== START setup $(date) ===" > "$LOG"
+
+          # 备份 .config（如存在）
+          if [ -f .config ]; then
+            cp .config /tmp/config.backup || true
+            echo ".config backed up" >> "$LOG"
+          fi
+
+          # 清理构建残留（优先 O=out）
+          echo "Running make O=out mrproper" >> "$LOG"
+          make O=out mrproper >> "$LOG" 2>&1 || true
+
+          # 保守 git 清理（CI 中通常安全）
+          echo "Running git reset --hard" >> "$LOG"
+          git reset --hard >> "$LOG" 2>&1 || true
+          echo "Running git clean -fdx" >> "$LOG"
+          git clean -fdx >> "$LOG" 2>&1 || true
+
+          # 恢复 .config 并生成 out/.config（如有备份）
+          if [ -f /tmp/config.backup ]; then
+            mv /tmp/config.backup .config || true
+            echo "Restored .config and running make O=out olddefconfig" >> "$LOG"
+            make O=out olddefconfig >> "$LOG" 2>&1 || true
+          fi
+
+          # 修补 techpack/display/msm/Makefile：插入 ifndef 保护并注释 warning 行
+          MF="techpack/display/msm/Makefile"
+          if [ -f "$MF" ]; then
+            echo "Patching $MF" >> "$LOG"
+            # 插入保护定义（仅在未存在时）
+            grep -q "ifndef OPLUS_FEATURE_PXLW_IRIS5" "$MF" >> "$LOG" 2>&1 || sed -i '1iifndef OPLUS_FEATURE_PXLW_IRIS5\nOPLUS_FEATURE_PXLW_IRIS5 := y\nendif\n' "$MF"
+            grep -q "ifndef PXLW_IRIS_DUAL" "$MF" >> "$LOG" 2>&1 || sed -i '1iifndef PXLW_IRIS_DUAL\nPXLW_IRIS_DUAL := y\nendif\n' "$MF"
+            # 注释掉包含重复定义提示的 warning 行，避免构建中断噪音
+            sed -i '/Defined OPLUS_FEATURE_PXLW_IRIS5/ s/^/#/' "$MF" || true
+            sed -i '/PXLW_IRIS_DUAL/ s/^/#/' "$MF" || true
+            echo "Patched $MF head (first 60 lines):" >> "$LOG"
+            sed -n '1,60p' "$MF" >> "$LOG" 2>&1 || true
+          else
+            echo "$MF not found, skipping patch" >> "$LOG"
+          fi
+
+          echo "=== END setup $(date) ===" >> "$LOG"
+
       - name: 运行 SukiSU 集成脚本（Manual hook / SUSFS）
         working-directory: kernel
         run: |
           set -e
-          echo "集成模式 SUKISU_MODE=${SUKISU_MODE}"
+          echo "Downloading SukiSU setup.sh"
           curl -fsSL https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh -o /tmp/sukisu-setup.sh
           chmod +x /tmp/sukisu-setup.sh
-          /tmp/sukisu-setup.sh ${SUKISU_MODE} || ( echo "SukiSU setup.sh 执行失败，请检查脚本输出" && exit 1 )
-          echo "SukiSU 集成脚本执行完成。列出变更："
-          git status --porcelain || true
-          git --no-pager diff --name-only || true
+          /tmp/sukisu-setup.sh ${SUKISU_MODE} >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || ( echo "SukiSU setup.sh failed, see setup.log" && exit 1 )
+          echo "SukiSU setup completed" >> "$GITHUB_WORKSPACE/kernel/setup.log"
 
       - name: 启用 Manual hook 的内核配置项
         working-directory: kernel
         run: |
           set -e
-          # 确保 scripts/config 可用
           if [ ! -x scripts/config ]; then
             chmod +x scripts/config || true
           fi
-          # 启用 Manual hook（CONFIG_KSU_MANUAL_HOOK）
           scripts/config --file .config --enable CONFIG_KSU_MANUAL_HOOK || true
-          # 可选：若你希望禁用 kprobes 自动集成，取消注释下一行
+          # 可选：禁用 kprobes 避免冲突（按需取消注释）
           # scripts/config --file .config --disable CONFIG_KPROBES || true
-          # 重新生成配置
-          make O=out ARCH=$ARCH olddefconfig || true
-          echo "已更新 .config，显示相关项："
-          grep -E "KSU_MANUAL_HOOK|KPROBES" -n .config || true
+          make O=out ARCH=$ARCH olddefconfig >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || true
+          grep -E "KSU_MANUAL_HOOK|KPROBES" -n .config >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || true
 
       - name: 准备 defconfig（若需要）
         working-directory: kernel
         run: |
           export ARCH=${{ env.ARCH }}
-          make O=out ARCH=$ARCH ${DEFCONFIG} HOSTPYTHON=/usr/bin/python2 || true
+          make O=out ARCH=$ARCH ${DEFCONFIG} HOSTPYTHON=/usr/bin/python2 >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || true
 
       - name: 验证交叉链接器可用
         working-directory: kernel
@@ -125,25 +140,23 @@ jobs:
           if command -v ${CROSS_COMPILE_AARCH64}ld >/dev/null 2>&1; then
             ${CROSS_COMPILE_AARCH64}ld --version || true
           else
-            echo "错误：交叉链接器 ${CROSS_COMPILE_AARCH64}ld 未找到，请确认工具链包含交叉 ld"
-            ls -la gcc64/bin || true
+            echo "ERROR: cross linker ${CROSS_COMPILE_AARCH64}ld not found" >> "$GITHUB_WORKSPACE/kernel/setup.log"
+            ls -la gcc64/bin >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || true
             exit 1
           fi
           if [ -f /usr/bin/ld.lld ]; then
             sudo rm -f /usr/bin/ld.lld || true
           fi
-          ld --version || true
+          ld --version >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || true
 
-      - name: 编译内核（Clang + GCC，使用交叉 ld）
+      - name: 编译并记录完整构建日志
         working-directory: kernel
         run: |
           set -e
-          export PATH=$GITHUB_WORKSPACE/clang/bin:$GITHUB_WORKSPACE/gcc64/bin:$GITHUB_WORKSPACE/gcc32/bin:$PATH
-          export HOSTPYTHON=/usr/bin/python2
-          export PYTHON=/usr/bin/python2
-          export CROSS_COMPILE=${CROSS_COMPILE_AARCH64}
-          export CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM}
-          make -j$(nproc) O=out ARCH=$ARCH CC=clang HOSTCC=gcc LD=${CROSS_COMPILE_AARCH64}ld HOSTLD=ld.bfd HOSTPYTHON=/usr/bin/python2
+          BUILD_LOG="$GITHUB_WORKSPACE/kernel/build.log"
+          echo "=== START build $(date) ===" > "$BUILD_LOG"
+          make -j$(nproc) O=out ARCH=$ARCH CC=clang HOSTCC=gcc LD=${CROSS_COMPILE_AARCH64}ld HOSTLD=ld.bfd HOSTPYTHON=/usr/bin/python2 >> "$BUILD_LOG" 2>&1 || ( echo "MAKE FAILED, see $BUILD_LOG" && cat "$BUILD_LOG" && exit 1 )
+          echo "=== END build $(date) ===" >> "$BUILD_LOG"
 
       - name: 立即备份并准备原始产物（未打包）
         if: success()
@@ -158,8 +171,8 @@ jobs:
             mkdir -p "$RAW_DIR/modules"
             cp -r out/lib/modules/* "$RAW_DIR/modules/" || true
           fi
-          echo "raw_artifacts 内容："
-          ls -la "$RAW_DIR" || true
+          echo "raw_artifacts content:" >> "$GITHUB_WORKSPACE/kernel/setup.log"
+          ls -la "$RAW_DIR" >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || true
 
       - name: 上传原始产物
         if: success()
@@ -183,13 +196,13 @@ jobs:
             sed -i 's/^BLOCK=.*/BLOCK=auto/' "$AKSH" || echo 'BLOCK=auto' >> "$AKSH"
             sed -i 's/^IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto/' "$AKSH" || echo 'IS_SLOT_DEVICE=auto' >> "$AKSH"
           else
-            echo "警告：AnyKernel3/anykernel.sh 未找到，跳过修改"
+            echo "Warning: AnyKernel3/anykernel.sh not found" >> "$GITHUB_WORKSPACE/kernel/setup.log"
           fi
           cd AnyKernel3
           OUT_ZIP="$GITHUB_WORKSPACE/${DEVICE}-kernel.zip"
           zip -r9 "$OUT_ZIP" . -x ".git/*" "README.md" "*placeholder"
-          echo "生成的 zip: $OUT_ZIP"
-          ls -lah "$OUT_ZIP" || true
+          echo "Generated zip: $OUT_ZIP" >> "$GITHUB_WORKSPACE/kernel/setup.log"
+          ls -lah "$OUT_ZIP" >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || true
 
       - name: 上传打包产物
         if: success()
@@ -197,3 +210,12 @@ jobs:
         with:
           name: ${{ env.DEVICE }}-kernel
           path: ${{ env.DEVICE }}-kernel.zip
+
+      - name: 上传日志 artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            kernel/setup.log
+            kernel/build.log
