@@ -17,7 +17,7 @@ env:
   AK3_BRANCH: master
 
   # SukiSU 集成模式：选择 "nongki" 或 "susfs-<branch>"（若不启用 SUSFS 用 nongki）
-  SUKISU_MODE: susfs-main
+  SUKISU_MODE: nongki
 
   # 内核构建配置
   DEFCONFIG: stock_defconfig
@@ -42,7 +42,6 @@ jobs:
 
       - name: 恢复/克隆工具链
         run: |
-          # 尝试从缓存目录使用工具链，否则克隆
           [ -d clang ] || git clone --depth=1 --branch $CLANG_BRANCH $CLANG_REPO clang
           [ -d gcc64 ] || git clone --depth=1 --branch $GCC64_BRANCH $GCC64_REPO gcc64
           [ -d gcc32 ] || git clone --depth=1 --branch $GCC32_BRANCH $GCC32_REPO gcc32
@@ -53,6 +52,28 @@ jobs:
           rm -rf kernel
           git clone --depth=1 --branch $KERNEL_BRANCH $KERNEL_REPO kernel
           ls -la kernel
+
+      - name: 确保内核源码干净（mrproper / git clean）
+        working-directory: kernel
+        run: |
+          set -e
+          echo "备份 .config（如存在）"
+          if [ -f .config ]; then
+            cp .config /tmp/config.backup || true
+          fi
+          # 优先清理 O=out 构建残留
+          make O=out mrproper || true
+          # 保守的 git 清理（CI 中通常安全）
+          git reset --hard || true
+          git clean -fdx || true
+          # 恢复 .config 并生成 out/.config（如有备份）
+          if [ -f /tmp/config.backup ]; then
+            mv /tmp/config.backup .config || true
+            make O=out olddefconfig || true
+          fi
+          echo "清理完成"
+          git status --porcelain || true
+          ls -la || true
 
       - name: 设置环境变量
         run: |
@@ -67,15 +88,12 @@ jobs:
         run: |
           set -e
           echo "集成模式 SUKISU_MODE=${SUKISU_MODE}"
-          # 下载并运行官方 setup.sh（脚本会在内核源码树中打补丁）
-          # 注意：请在本地先验证脚本行为再在主分支运行
           curl -fsSL https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh -o /tmp/sukisu-setup.sh
           chmod +x /tmp/sukisu-setup.sh
-          # 运行脚本：参数为模式（nongki 或 susfs-<branch>）
           /tmp/sukisu-setup.sh ${SUKISU_MODE} || ( echo "SukiSU setup.sh 执行失败，请检查脚本输出" && exit 1 )
-          echo "SukiSU 集成脚本执行完成。请检查 kernel/ 下的补丁与变更："
-          git -C . status --porcelain || true
-          git -C . --no-pager diff --name-only || true
+          echo "SukiSU 集成脚本执行完成。列出变更："
+          git status --porcelain || true
+          git --no-pager diff --name-only || true
 
       - name: 启用 Manual hook 的内核配置项
         working-directory: kernel
@@ -85,12 +103,12 @@ jobs:
           if [ ! -x scripts/config ]; then
             chmod +x scripts/config || true
           fi
-          # 启用 Manual hook（CONFIG_KSU_MANUAL_HOOK），并确保 kprobes 不冲突（可按需调整）
+          # 启用 Manual hook（CONFIG_KSU_MANUAL_HOOK）
           scripts/config --file .config --enable CONFIG_KSU_MANUAL_HOOK || true
-          # 如果你希望禁用 kprobes 自动集成（避免冲突），可取消注释下一行
+          # 可选：若你希望禁用 kprobes 自动集成，取消注释下一行
           # scripts/config --file .config --disable CONFIG_KPROBES || true
-          # 重新生成配置（保守使用 olddefconfig）
-          make O=out ARCH=$ARCH olddefconfig || make O=out ARCH=$ARCH oldconfig || true
+          # 重新生成配置
+          make O=out ARCH=$ARCH olddefconfig || true
           echo "已更新 .config，显示相关项："
           grep -E "KSU_MANUAL_HOOK|KPROBES" -n .config || true
 
@@ -99,6 +117,22 @@ jobs:
         run: |
           export ARCH=${{ env.ARCH }}
           make O=out ARCH=$ARCH ${DEFCONFIG} HOSTPYTHON=/usr/bin/python2 || true
+
+      - name: 验证交叉链接器可用
+        working-directory: kernel
+        run: |
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$GITHUB_WORKSPACE/gcc64/bin:$GITHUB_WORKSPACE/gcc32/bin:$PATH
+          if command -v ${CROSS_COMPILE_AARCH64}ld >/dev/null 2>&1; then
+            ${CROSS_COMPILE_AARCH64}ld --version || true
+          else
+            echo "错误：交叉链接器 ${CROSS_COMPILE_AARCH64}ld 未找到，请确认工具链包含交叉 ld"
+            ls -la gcc64/bin || true
+            exit 1
+          fi
+          if [ -f /usr/bin/ld.lld ]; then
+            sudo rm -f /usr/bin/ld.lld || true
+          fi
+          ld --version || true
 
       - name: 编译内核（Clang + GCC，使用交叉 ld）
         working-directory: kernel
@@ -109,10 +143,9 @@ jobs:
           export PYTHON=/usr/bin/python2
           export CROSS_COMPILE=${CROSS_COMPILE_AARCH64}
           export CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM}
-          # 使用交叉 ld 链接 aarch64 目标
           make -j$(nproc) O=out ARCH=$ARCH CC=clang HOSTCC=gcc LD=${CROSS_COMPILE_AARCH64}ld HOSTLD=ld.bfd HOSTPYTHON=/usr/bin/python2
 
-      - name: 立即备份并上传原始产物（未打包）
+      - name: 立即备份并准备原始产物（未打包）
         if: success()
         working-directory: kernel
         run: |
@@ -143,7 +176,6 @@ jobs:
           git clone --depth=1 --branch $AK3_BRANCH $AK3_SOURCE AnyKernel3
           mkdir -p AnyKernel3/kernel
           cp -r $GITHUB_WORKSPACE/raw_artifacts/* AnyKernel3/kernel/ || true
-          # 确保 anykernel.sh 存在并替换/追加关键属性
           AKSH=AnyKernel3/anykernel.sh
           if [ -f "$AKSH" ]; then
             sed -i 's/^kernel.string=.*/kernel.string="PDEM10 Kernel by Hydrogen"/' "$AKSH" || echo 'kernel.string="PDEM10 Kernel by Hydrogen"' >> "$AKSH"
