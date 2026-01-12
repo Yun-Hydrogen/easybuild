@@ -1,4 +1,4 @@
-name: 构建内核并集成 SukiSU（补丁追加方式，干净克隆）
+name: 构建内核并集成 SukiSU (使用 susfs-main)
 
 on:
   workflow_dispatch:
@@ -60,43 +60,38 @@ jobs:
           LOG="$GITHUB_WORKSPACE/kernel/setup.log"
           echo "=== START setup $(date) ===" > "$LOG"
 
-          # 备份 .config（如存在）
           if [ -f .config ]; then
             cp .config /tmp/config.backup || true
             echo ".config backed up" >> "$LOG"
           fi
 
-          # 清理残留（优先 O=out）
           echo "Running make O=out mrproper" >> "$LOG"
           make O=out mrproper >> "$LOG" 2>&1 || true
 
-          # 保证干净树
           echo "Running git reset --hard && git clean -fdx" >> "$LOG"
           git reset --hard >> "$LOG" 2>&1 || true
           git clean -fdx >> "$LOG" 2>&1 || true
 
-          # 恢复 .config 并使用 non-interactive olddefconfig（如有备份）
           if [ -f /tmp/config.backup ]; then
             mv /tmp/config.backup .config || true
             echo "Restored .config and running non-interactive olddefconfig" >> "$LOG"
             yes "" | make O=out olddefconfig >> "$LOG" 2>&1 || true
           fi
 
-          # 安全追加保护块：仅在文件中不存在时追加（避免破坏现有结构）
           MF="techpack/display/msm/Makefile"
           if [ -f "$MF" ]; then
             echo "Patching $MF (append-only if guards missing)" >> "$LOG"
             cp "$MF" "${MF}.bak" || true
 
             if ! grep -q "ifndef PXLW_IRIS_DUAL" "$MF"; then
-              printf '\n#ifndef PXLW_IRIS_DUAL\nPXLW_IRIS_DUAL := y\n#endif\n' >> "$MF"
+              printf '\nifndef PXLW_IRIS_DUAL\nPXLW_IRIS_DUAL := y\nendif\n' >> "$MF"
               echo "Appended PXLW_IRIS_DUAL guard" >> "$LOG"
             else
               echo "PXLW_IRIS_DUAL guard already present, skipping" >> "$LOG"
             fi
 
             if ! grep -q "ifndef OPLUS_FEATURE_PXLW_IRIS5" "$MF"; then
-              printf '\n#ifndef OPLUS_FEATURE_PXLW_IRIS5\nOPLUS_FEATURE_PXLW_IRIS5 := y\n#endif\n' >> "$MF"
+              printf '\nifndef OPLUS_FEATURE_PXLW_IRIS5\nOPLUS_FEATURE_PXLW_IRIS5 := y\nendif\n' >> "$MF"
               echo "Appended OPLUS_FEATURE_PXLW_IRIS5 guard" >> "$LOG"
             else
               echo "OPLUS_FEATURE_PXLW_IRIS5 guard already present, skipping" >> "$LOG"
@@ -110,27 +105,49 @@ jobs:
 
           echo "=== END setup $(date) ===" >> "$LOG"
 
-      - name: 运行 SukiSU 集成脚本（Manual hook / SUSFS）
+      - name: 验证 SukiSU susfs-main 分支可用（预检）
         working-directory: kernel
         run: |
           set -e
-          echo "Downloading SukiSU setup.sh"
+          LOG="$GITHUB_WORKSPACE/kernel/setup.log"
+          echo "Checking SukiSU susfs-main availability" >> "$LOG"
+          # 克隆 SukiSU-Ultra 仓库到临时目录并检查分支
+          TMPDIR="$GITHUB_WORKSPACE/sukisu_tmp"
+          rm -rf "$TMPDIR"
+          git clone --depth=1 https://github.com/SukiSU-Ultra/SukiSU-Ultra.git "$TMPDIR" >> "$LOG" 2>&1 || ( echo "Failed to clone SukiSU-Ultra" >> "$LOG" && exit 1 )
+          cd "$TMPDIR"
+          # 列出远程分支并检查是否存在 susfs-main
+          if git ls-remote --heads origin susfs-main | grep -q susfs-main; then
+            echo "susfs-main branch exists in SukiSU-Ultra" >> "$LOG"
+          else
+            echo "ERROR: susfs-main branch not found in SukiSU-Ultra. Aborting." >> "$LOG"
+            git --no-pager branch -a >> "$LOG" 2>&1 || true
+            exit 1
+          fi
+
+      - name: 运行 SukiSU 集成脚本（使用 susfs-main）
+        working-directory: kernel
+        run: |
+          set -e
+          LOG="$GITHUB_WORKSPACE/kernel/setup.log"
+          echo "Downloading SukiSU setup.sh" >> "$LOG"
           curl -fsSL https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh -o /tmp/sukisu-setup.sh
           chmod +x /tmp/sukisu-setup.sh
-          /tmp/sukisu-setup.sh ${SUKISU_MODE} >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || ( echo "SukiSU setup.sh failed, see setup.log" && exit 1 )
-          echo "SukiSU setup completed" >> "$GITHUB_WORKSPACE/kernel/setup.log"
+          # 直接传入 susfs-main 模式；若脚本内部尝试 checkout 对应分支，应已通过上一步验证
+          /tmp/sukisu-setup.sh ${SUKISU_MODE} >> "$LOG" 2>&1 || ( echo "SukiSU setup.sh failed; see setup.log" >> "$LOG" && exit 1 )
+          echo "SukiSU setup completed (mode: ${SUKISU_MODE})" >> "$LOG"
 
       - name: 启用 Manual hook 的内核配置项（非交互）
         working-directory: kernel
         run: |
           set -e
+          LOG="$GITHUB_WORKSPACE/kernel/setup.log"
           if [ ! -x scripts/config ]; then
             chmod +x scripts/config || true
           fi
           scripts/config --file .config --enable CONFIG_KSU_MANUAL_HOOK || true
-          # 使用 non-interactive olddefconfig（避免交互）
-          yes "" | make O=out ARCH=$ARCH olddefconfig >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || true
-          grep -E "KSU_MANUAL_HOOK|KPROBES" -n .config >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || true
+          yes "" | make O=out ARCH=$ARCH olddefconfig >> "$LOG" 2>&1 || true
+          grep -E "KSU_MANUAL_HOOK|KPROBES" -n .config >> "$LOG" 2>&1 || true
 
       - name: 准备 defconfig（非交互）
         working-directory: kernel
