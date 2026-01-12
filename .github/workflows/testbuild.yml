@@ -1,0 +1,338 @@
+name: 构建内核并集成 SukiSU+SUSFS PDEM10
+
+on:
+  workflow_dispatch:
+
+env:
+  KERNEL_REPO: https://github.com/Yun-Hydrogen/Oppo_Findx2_Sukisu_Kernel.git
+  KERNEL_BRANCH: oss-t
+  CLANG_REPO: https://github.com/blacklytning/clang-13.0.1.git
+  CLANG_BRANCH: 11
+  GCC64_REPO: https://github.com/JackA1ltman/Google-GCC-Android-4.9.git
+  GCC64_BRANCH: aarch64
+  GCC32_REPO: https://github.com/JackA1ltman/Google-GCC-Android-4.9.git
+  GCC32_BRANCH: arm32
+  AK3_SOURCE: https://github.com/osm0sis/AnyKernel3.git
+  AK3_BRANCH: master
+  DEFCONFIG: stock_defconfig
+  ARCH: arm64
+  DEVICE: PDEM10
+  CROSS_COMPILE_AARCH64: aarch64-linux-android-
+  CROSS_COMPILE_ARM: arm-linux-androideabi-
+  SUKISU_REPO: https://github.com/SukiSU-Ultra/SukiSU-Ultra.git
+  SUKISU_BRANCH: tmp-builtin
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装依赖并配置 python2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev libncurses-dev ccache python2 git wget zip unzip binutils patch
+          sudo ln -sf /usr/bin/python2 /usr/bin/python
+          python --version
+
+      - name: 恢复 clang 缓存
+        uses: actions/cache@v4
+        with:
+          path: clang
+          key: clang-${{ env.CLANG_BRANCH }}-${{ runner.os }}
+          restore-keys: |
+            clang-${{ env.CLANG_BRANCH }}-${{ runner.os }}-
+            clang-${{ runner.os }}-
+
+      - name: 恢复 gcc64 缓存
+        uses: actions/cache@v4
+        with:
+          path: gcc64
+          key: gcc64-${{ env.GCC64_BRANCH }}-${{ runner.os }}
+          restore-keys: |
+            gcc64-${{ env.GCC64_BRANCH }}-${{ runner.os }}-
+            gcc64-${{ runner.os }}-
+
+      - name: 恢复 gcc32 缓存
+        uses: actions/cache@v4
+        with:
+          path: gcc32
+          key: gcc32-${{ env.GCC32_BRANCH }}-${{ runner.os }}
+          restore-keys: |
+            gcc32-${{ env.GCC32_BRANCH }}-${{ runner.os }}-
+            gcc32-${{ runner.os }}-
+
+      - name: 克隆工具链（若缓存未命中）
+        run: |
+          [ -d clang ] || git clone --depth=1 --branch $CLANG_BRANCH $CLANG_REPO clang
+          [ -d gcc64 ] || git clone --depth=1 --branch $GCC64_BRANCH $GCC64_REPO gcc64
+          [ -d gcc32 ] || git clone --depth=1 --branch $GCC32_BRANCH $GCC32_REPO gcc32
+
+      - name: 克隆内核源码
+        run: |
+          rm -rf kernel
+          git clone --depth=1 --branch $KERNEL_BRANCH $KERNEL_REPO kernel
+
+      - name: 集成 SukiSU 并安装 SUSFS
+        working-directory: kernel
+        run: |
+          set -e
+          # 从 SukiSU tmp-builtin 分支拉取 setup.sh 并执行，参数为 susfs-1.4.2-kernel-4.19
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${SUKISU_BRANCH}/kernel/setup.sh" | bash -s susfs-1.4.2-kernel-4.19 || {
+            echo "执行 setup.sh 失败，请检查 URL 或脚本兼容性"; exit 0; }
+
+      - name: 写入并应用 su_ksu_hooks.patch
+        working-directory: kernel
+        run: |
+          set -e
+          cat > su_ksu_hooks.patch <<'PATCH'
+diff --git a/fs/exec.c b/fs/exec.c
+index ac59664eaecf..bdd585e1d2cc 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -1890,11 +1890,14 @@ static int __do_execve_file(int fd, struct filename *filename,
+    return retval;
+ }
+ 
++#ifdef CONFIG_KSU
++extern bool ksu_execveat_hook __read_mostly;
++extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
++           void *envp, int *flags);
++extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
++                void *argv, void *envp, int *flags);
++#endif
+ static int do_execveat_common(int fd, struct filename *filename,
+                  struct user_arg_ptr argv,
+                  struct user_arg_ptr envp,
+                  int flags)
+ {
++   #ifdef CONFIG_KSU
++   if (unlikely(ksu_execveat_hook))
++       ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
++   else
++       ksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);
++   #endif
+    return __do_execve_file(fd, filename, argv, envp, flags, NULL);
+ }
+diff --git a/fs/open.c b/fs/open.c
+index 05036d819197..965b84d486b8 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -348,6 +348,8 @@ SYSCALL_DEFINE4(fallocate, int, fd, int, mode, loff_t, offset, loff_t, len)
+    return ksys_fallocate(fd, mode, offset, len);
+ }
+ 
++#ifdef CONFIG_KSU
++extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
++            int *flags);
++#endif
+ /*
+  * access() needs to use the real uid/gid, not the effective uid/gid.
+  * We do this by temporarily clearing all FS-related capabilities and
+@@ -355,6 +357,7 @@ SYSCALL_DEFINE4(fallocate, int, fd, int, mode, loff_t, offset, loff_t, len)
+  */
+ long do_faccessat(int dfd, const char __user *filename, int mode)
+ {
+@@
+    unsigned int lookup_flags = LOOKUP_FOLLOW;
++   #ifdef CONFIG_KSU
++   ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
++   #endif
+diff --git a/fs/read_write.c b/fs/read_write.c
+index 650fc7e0f3a6..55be193913b6 100644
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -434,10 +434,14 @@ ssize_t kernel_read(struct file *file, void *buf, size_t count, loff_t *pos)
+ }
+ EXPORT_SYMBOL(kernel_read);
+ 
++#ifdef CONFIG_KSU
++extern bool ksu_vfs_read_hook __read_mostly;
++extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,
++           size_t *count_ptr, loff_t **pos);
++#endif
+ ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
+ {
+    ssize_t ret;
++   #ifdef CONFIG_KSU 
++   if (unlikely(ksu_vfs_read_hook))
++       ksu_handle_vfs_read(&file, &buf, &count, &pos);
++   #endif
++
+    if (!(file->f_mode & FMODE_READ))
+        return -EBADF;
+    if (!(file->f_mode & FMODE_CAN_READ))
+diff --git a/fs/stat.c b/fs/stat.c
+index 376543199b5a..82adcef03ecc 100644
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -148,6 +148,8 @@ int vfs_statx_fd(unsigned int fd, struct kstat *stat,
+ }
+ EXPORT_SYMBOL(vfs_statx_fd);
+ 
++#ifdef CONFIG_KSU
++extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
++#endif
++
+ /**
+  * vfs_statx - Get basic and extra attributes by filename
+  * @dfd: A file descriptor representing the base dir for a relative filename
+@@ -170,6 +172,7 @@ int vfs_statx(int dfd, const char __user *filename, int flags,
+    int error = -EINVAL;
+    unsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;
+ 
++   #ifdef CONFIG_KSU
++   ksu_handle_stat(&dfd, &filename, &flags);
++   #endif
+    if ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |
+               AT_EMPTY_PATH | KSTAT_QUERY_FLAGS)) != 0)
+        return -EINVAL;
+diff --git a/drivers/input/input.c b/drivers/input/input.c
+index 45306f9ef247..815091ebfca4 100755
+--- a/drivers/input/input.c
++++ b/drivers/input/input.c
+@@ -367,10 +367,13 @@ static int input_get_disposition(struct input_dev *dev,
+    return disposition;
+ }
+ 
++#ifdef CONFIG_KSU
++extern bool ksu_input_hook __read_mostly;
++extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
++#endif
++
+ static void input_handle_event(struct input_dev *dev,
+                   unsigned int type, unsigned int code, int value)
+ {
+    int disposition = input_get_disposition(dev, type, code, &value);
++   #ifdef CONFIG_KSU
++   if (unlikely(ksu_input_hook))
++       ksu_handle_input_handle_event(&type, &code, &value);
++   #endif
+ 
+    if (disposition != INPUT_IGNORE_EVENT && type != EV_SYN)
+        add_input_randomness(type, code, value);
+diff --git a/fs/namespace.c b/fs/namespace.c
+index 000000000000..000000000000 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -1739,6 +1739,39 @@ static inline bool may_mandlock(void)
+ }
+ #endif
++
++static int can_umount(const struct path *path, int flags)
++{
++   struct mount *mnt = real_mount(path->mnt);
++
++   if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
++       return -EINVAL;
++   if (!may_mount())
++       return -EPERM;
++   if (path->dentry != path->mnt->mnt_root)
++       return -EINVAL;
++   if (!check_mnt(mnt))
++       return -EINVAL;
++   if (mnt->mnt.mnt_flags & MNT_LOCKED) /* Check optimistically */
++       return -EINVAL;
++   if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
++       return -EPERM;
++   return 0;
++}
++
++int path_umount(struct path *path, int flags)
++{
++   struct mount *mnt = real_mount(path->mnt);
++   int ret;
++
++   ret = can_umount(path, flags);
++   if (!ret)
++       ret = do_umount(mnt, flags);
++
++   /* we mustn't call path_put() as that would clear mnt_expiry_mark */
++   dput(path->dentry);
++   mntput_no_expire(mnt);
++   return ret;
++}
+PATCH
+
+          # 尝试应用补丁
+          if git apply --index su_ksu_hooks.patch; then
+            echo "git apply 成功"
+          else
+            echo "git apply 失败，尝试 patch -p0"
+            patch -p0 < su_ksu_hooks.patch || true
+          fi
+          # 输出被修改或未命中的文件以便调试
+          git --no-pager diff --name-only || true
+
+      - name: 设置 CONFIG_KSU 并准备 defconfig
+        working-directory: kernel
+        run: |
+          set -e
+          export ARCH=${{ env.ARCH }}
+          # 先生成 defconfig
+          make O=out ARCH=$ARCH ${DEFCONFIG} HOSTPYTHON=/usr/bin/python2 || true
+          # 尝试使用 scripts/config 启用 CONFIG_KSU，否则直接写入 .config
+          if [ -x scripts/config ]; then
+            scripts/config --file out/.config --enable KSU || true
+            cp out/.config .config || true
+          else
+            grep -q '^CONFIG_KSU=' .config || echo 'CONFIG_KSU=y' >> .config
+          fi
+          # 更新配置
+          make O=out ARCH=$ARCH olddefconfig HOSTPYTHON=/usr/bin/python2 || true
+
+      - name: 编译内核（Clang + GCC，使用交叉 ld）
+        working-directory: kernel
+        run: |
+          set -e
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$GITHUB_WORKSPACE/gcc64/bin:$GITHUB_WORKSPACE/gcc32/bin:$PATH
+          export HOSTPYTHON=/usr/bin/python2
+          export PYTHON=/usr/bin/python2
+          export CROSS_COMPILE=${CROSS_COMPILE_AARCH64}
+          export CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM}
+          make -j$(nproc) O=out ARCH=$ARCH CC=clang HOSTCC=gcc LD=${CROSS_COMPILE_AARCH64}ld HOSTLD=ld.bfd HOSTPYTHON=/usr/bin/python2
+
+      - name: 立即备份并上传原始产物
+        if: success()
+        working-directory: kernel
+        run: |
+          RAW_DIR="$GITHUB_WORKSPACE/raw_artifacts"
+          mkdir -p "$RAW_DIR"
+          cp -v out/arch/arm64/boot/Image* "$RAW_DIR/" 2>/dev/null || true
+          cp -v out/System.map "$RAW_DIR/" 2>/dev/null || true
+          if [ -d out/lib/modules ]; then
+            mkdir -p "$RAW_DIR/modules"
+            cp -r out/lib/modules/* "$RAW_DIR/modules/" || true
+          fi
+          ls -la "$RAW_DIR" || true
+
+      - name: 上传原始产物
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-${{ env.DEVICE }}
+          path: raw_artifacts
+
+      - name: 打包 AnyKernel3（修改 anykernel.sh）
+        if: success()
+        working-directory: kernel
+        run: |
+          git clone --depth=1 --branch $AK3_BRANCH $AK3_SOURCE AnyKernel3
+          mkdir -p AnyKernel3/kernel
+          cp -r $GITHUB_WORKSPACE/raw_artifacts/* AnyKernel3/kernel/ || true
+          sed -i 's/^kernel.string=.*/kernel.string="PDEM10 Kernel by Hydrogen"/' AnyKernel3/anykernel.sh || echo 'kernel.string="PDEM10 Kernel by Hydrogen"' >> AnyKernel3/anykernel.sh
+          sed -i 's/^device.name1=.*/device.name1=PDEM10/' AnyKernel3/anykernel.sh || echo 'device.name1=PDEM10' >> AnyKernel3/anykernel.sh
+          sed -i 's/^BLOCK=.*/BLOCK=auto/' AnyKernel3/anykernel.sh || echo 'BLOCK=auto' >> AnyKernel3/anykernel.sh
+          sed -i 's/^IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto/' AnyKernel3/anykernel.sh || echo 'IS_SLOT_DEVICE=auto' >> AnyKernel3/anykernel.sh
+          cd AnyKernel3
+          OUT_ZIP="$GITHUB_WORKSPACE/${DEVICE}-kernel.zip"
+          zip -r "$OUT_ZIP" . -x ".git/*" "README.md" "*placeholder"
+          ls -lah "$OUT_ZIP" || true
+
+      - name: 上传打包产物
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DEVICE }}-kernel
+          path: ${{ env.DEVICE }}-kernel.zip
