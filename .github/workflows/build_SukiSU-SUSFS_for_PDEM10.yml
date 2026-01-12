@@ -14,7 +14,7 @@ env:
   GCC32_BRANCH: arm32
   AK3_SOURCE: https://github.com/osm0sis/AnyKernel3.git
   AK3_BRANCH: master
-  SUKISU_MODE: nongki
+  SUKISU_MODE: susfs-main
   DEFCONFIG: stock_defconfig
   ARCH: arm64
   DEVICE: PDEM10
