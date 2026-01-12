@@ -1,4 +1,4 @@
-name: 构建内核并集成 SukiSU 修复 techpack Makefile V2
+name: 构建内核并集成 SukiSU（补丁追加方式，干净克隆）
 
 on:
   workflow_dispatch:
@@ -20,73 +20,45 @@ env:
   DEVICE: PDEM10
   CROSS_COMPILE_AARCH64: aarch64-linux-android-
   CROSS_COMPILE_ARM: arm-linux-androideabi-
-  # 统一输出目录，避免混用导致检测失败
-  KBUILD_OUTPUT: ${{ github.workspace }}/kernel/out
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: 检出仓库
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: 安装依赖并配置 python2
+      - name: 安装依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential bc bison flex libssl-dev libncurses-dev ccache python2 git wget zip unzip binutils curl lld
+          sudo apt-get install -y build-essential bc bison flex libssl-dev libncurses-dev ccache python2 git wget zip unzip binutils curl
           sudo ln -sf /usr/bin/python2 /usr/bin/python
           python --version
 
-      - name: 恢复/克隆工具链
+      - name: 克隆工具链
         run: |
           [ -d clang ] || git clone --depth=1 --branch $CLANG_BRANCH $CLANG_REPO clang
           [ -d gcc64 ] || git clone --depth=1 --branch $GCC64_BRANCH $GCC64_REPO gcc64
           [ -d gcc32 ] || git clone --depth=1 --branch $GCC32_BRANCH $GCC32_REPO gcc32
           ls -la clang gcc64 gcc32 || true
 
-      - name: 克隆内核源码
+      - name: 干净克隆内核源码
         run: |
           rm -rf kernel
           git clone --depth=1 --branch $KERNEL_BRANCH $KERNEL_REPO kernel
           ls -la kernel
 
-      - name: 设置环境变量（PATH 与 KBUILD_OUTPUT）
+      - name: 设置环境变量
         run: |
           echo "PATH=$PWD/clang/bin:$PWD/gcc64/bin:$PWD/gcc32/bin:$PATH" >> $GITHUB_ENV
           echo "CROSS_COMPILE_AARCH64=${{ env.CROSS_COMPILE_AARCH64 }}" >> $GITHUB_ENV
           echo "CROSS_COMPILE_ARM=${{ env.CROSS_COMPILE_ARM }}" >> $GITHUB_ENV
           echo "HOSTPYTHON=/usr/bin/python2" >> $GITHUB_ENV
           echo "PYTHON=/usr/bin/python2" >> $GITHUB_ENV
-          # 确保 KBUILD_OUTPUT 一致（避免 make 检测到 .. 作为源）
-          echo "KBUILD_OUTPUT=${{ env.KBUILD_OUTPUT }}" >> $GITHUB_ENV
 
-      - name: 在源码顶层做彻底清理以避免 'Using .. as source' 错误
+      - name: 记录准备日志并安全追加保护块（无 heredoc）
         working-directory: kernel
         run: |
           set -e
           LOG="$GITHUB_WORKSPACE/kernel/setup.log"
-          echo "=== CLEAN START $(date) ===" >> "$LOG"
-          # 先尝试 make mrproper（不带 O=out）清理源码顶层残留
-          if command -v make >/dev/null 2>&1; then
-            make mrproper || true
-          fi
-          # 删除 include/config（常见触发点）
-          rm -rf include/config || true
-          # 保守的 git 清理
-          git reset --hard || true
-          git clean -fdx || true
-          # 再清理输出目录（如果存在）
-          rm -rf out || true
-          echo "=== CLEAN END $(date) ===" >> "$LOG"
-
-      - name: 捕获并记录准备与修补日志
-        working-directory: kernel
-        run: |
-          set -e
-          LOG="$GITHUB_WORKSPACE/kernel/setup.log"
-          echo "=== START setup $(date) ===" >> "$LOG"
+          echo "=== START setup $(date) ===" > "$LOG"
 
           # 备份 .config（如存在）
           if [ -f .config ]; then
@@ -94,26 +66,40 @@ jobs:
             echo ".config backed up" >> "$LOG"
           fi
 
-          # 使用 O=out 的 mrproper 以清理输出目录残留（双保险）
+          # 清理残留（优先 O=out）
+          echo "Running make O=out mrproper" >> "$LOG"
           make O=out mrproper >> "$LOG" 2>&1 || true
 
-          # 修补 techpack/display/msm/Makefile：保守移除触发警告的行并在末尾追加 ifndef 块（不会破坏现有结构）
+          # 保证干净树
+          echo "Running git reset --hard && git clean -fdx" >> "$LOG"
+          git reset --hard >> "$LOG" 2>&1 || true
+          git clean -fdx >> "$LOG" 2>&1 || true
+
+          # 恢复 .config 并使用 non-interactive olddefconfig（如有备份）
+          if [ -f /tmp/config.backup ]; then
+            mv /tmp/config.backup .config || true
+            echo "Restored .config and running non-interactive olddefconfig" >> "$LOG"
+            yes "" | make O=out olddefconfig >> "$LOG" 2>&1 || true
+          fi
+
+          # 安全追加保护块：仅在文件中不存在时追加（避免破坏现有结构）
           MF="techpack/display/msm/Makefile"
           if [ -f "$MF" ]; then
-            echo "Patching $MF" >> "$LOG"
+            echo "Patching $MF (append-only if guards missing)" >> "$LOG"
             cp "$MF" "${MF}.bak" || true
 
-            sed -i '/Defined OPLUS_FEATURE_PXLW_IRIS5/d' "$MF" || true
-            sed -i '/PXLW_IRIS_DUAL/d' "$MF" || true
-            sed -i '/\$(warning.*OPLUS_FEATURE_PXLW_IRIS5)/d' "$MF" || true
-            sed -i '/\$(warning.*PXLW_IRIS_DUAL)/d' "$MF" || true
-
-            if ! grep -q "ifndef OPLUS_FEATURE_PXLW_IRIS5" "$MF"; then
-              printf '\nifndef OPLUS_FEATURE_PXLW_IRIS5\nOPLUS_FEATURE_PXLW_IRIS5 := y\nendif\n' >> "$MF"
+            if ! grep -q "ifndef PXLW_IRIS_DUAL" "$MF"; then
+              printf '\n#ifndef PXLW_IRIS_DUAL\nPXLW_IRIS_DUAL := y\n#endif\n' >> "$MF"
+              echo "Appended PXLW_IRIS_DUAL guard" >> "$LOG"
+            else
+              echo "PXLW_IRIS_DUAL guard already present, skipping" >> "$LOG"
             fi
 
-            if ! grep -q "ifndef PXLW_IRIS_DUAL" "$MF"; then
-              printf '\nifndef PXLW_IRIS_DUAL\nPXLW_IRIS_DUAL := y\nendif\n' >> "$MF"
+            if ! grep -q "ifndef OPLUS_FEATURE_PXLW_IRIS5" "$MF"; then
+              printf '\n#ifndef OPLUS_FEATURE_PXLW_IRIS5\nOPLUS_FEATURE_PXLW_IRIS5 := y\n#endif\n' >> "$MF"
+              echo "Appended OPLUS_FEATURE_PXLW_IRIS5 guard" >> "$LOG"
+            else
+              echo "OPLUS_FEATURE_PXLW_IRIS5 guard already present, skipping" >> "$LOG"
             fi
 
             echo "Patched $MF tail (last 60 lines):" >> "$LOG"
@@ -128,55 +114,45 @@ jobs:
         working-directory: kernel
         run: |
           set -e
-          LOG="$GITHUB_WORKSPACE/kernel/setup.log"
-          echo "=== START SukiSU $(date) ===" >> "$LOG"
-          echo "Downloading SukiSU setup.sh" >> "$LOG"
+          echo "Downloading SukiSU setup.sh"
           curl -fsSL https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh -o /tmp/sukisu-setup.sh
           chmod +x /tmp/sukisu-setup.sh
-          # 传入模式并记录输出
-          /tmp/sukisu-setup.sh ${SUKISU_MODE} >> "$LOG" 2>&1 || ( echo "SukiSU setup.sh failed, see setup.log" && exit 1 )
-          echo "SukiSU setup completed" >> "$LOG"
-          echo "=== END SukiSU $(date) ===" >> "$LOG"
+          /tmp/sukisu-setup.sh ${SUKISU_MODE} >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || ( echo "SukiSU setup.sh failed, see setup.log" && exit 1 )
+          echo "SukiSU setup completed" >> "$GITHUB_WORKSPACE/kernel/setup.log"
 
       - name: 启用 Manual hook 的内核配置项（非交互）
         working-directory: kernel
         run: |
           set -e
-          LOG="$GITHUB_WORKSPACE/kernel/setup.log"
           if [ ! -x scripts/config ]; then
             chmod +x scripts/config || true
           fi
-          # 使用 scripts/config 修改 .config（如果不存在会在后面生成）
           scripts/config --file .config --enable CONFIG_KSU_MANUAL_HOOK || true
-          # 使用 non-interactive olddefconfig（确保 .config 与 out/.config 一致）
-          export KBUILD_OUTPUT=${{ env.KBUILD_OUTPUT }}
-          yes "" | make O=out ARCH=$ARCH olddefconfig HOSTPYTHON=/usr/bin/python2 >> "$LOG" 2>&1 || true
-          grep -E "KSU_MANUAL_HOOK|KPROBES" -n .config >> "$LOG" 2>&1 || true
+          # 使用 non-interactive olddefconfig（避免交互）
+          yes "" | make O=out ARCH=$ARCH olddefconfig >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || true
+          grep -E "KSU_MANUAL_HOOK|KPROBES" -n .config >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || true
 
       - name: 准备 defconfig（非交互）
         working-directory: kernel
         run: |
-          set -e
-          LOG="$GITHUB_WORKSPACE/kernel/setup.log"
           export ARCH=${{ env.ARCH }}
-          export KBUILD_OUTPUT=${{ env.KBUILD_OUTPUT }}
-          yes "" | make O=out ARCH=$ARCH ${DEFCONFIG} HOSTPYTHON=/usr/bin/python2 >> "$LOG" 2>&1 || true
+          yes "" | make O=out ARCH=$ARCH ${DEFCONFIG} HOSTPYTHON=/usr/bin/python2 >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || true
 
       - name: 验证交叉链接器可用
         working-directory: kernel
         run: |
-          set -e
-          LOG="$GITHUB_WORKSPACE/kernel/setup.log"
           export PATH=$GITHUB_WORKSPACE/clang/bin:$GITHUB_WORKSPACE/gcc64/bin:$GITHUB_WORKSPACE/gcc32/bin:$PATH
-          export KBUILD_OUTPUT=${{ env.KBUILD_OUTPUT }}
           if command -v ${CROSS_COMPILE_AARCH64}ld >/dev/null 2>&1; then
-            ${CROSS_COMPILE_AARCH64}ld --version >> "$LOG" 2>&1 || true
+            ${CROSS_COMPILE_AARCH64}ld --version || true
           else
-            echo "ERROR: cross linker ${CROSS_COMPILE_AARCH64}ld not found" >> "$LOG"
-            ls -la gcc64/bin >> "$LOG" 2>&1 || true
+            echo "ERROR: cross linker ${CROSS_COMPILE_AARCH64}ld not found" >> "$GITHUB_WORKSPACE/kernel/setup.log"
+            ls -la gcc64/bin >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || true
             exit 1
           fi
-          ld --version >> "$LOG" 2>&1 || true
+          if [ -f /usr/bin/ld.lld ]; then
+            sudo rm -f /usr/bin/ld.lld || true
+          fi
+          ld --version >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || true
 
       - name: 编译并记录完整构建日志
         working-directory: kernel
@@ -184,10 +160,7 @@ jobs:
           set -e
           BUILD_LOG="$GITHUB_WORKSPACE/kernel/build.log"
           echo "=== START build $(date) ===" > "$BUILD_LOG"
-          export PATH=$GITHUB_WORKSPACE/clang/bin:$GITHUB_WORKSPACE/gcc64/bin:$GITHUB_WORKSPACE/gcc32/bin:$PATH
-          export KBUILD_OUTPUT=${{ env.KBUILD_OUTPUT }}
-          # 使用一致的 O=out 与 CC=clang
-          make -j$(nproc) O=out ARCH=$ARCH CC=clang CROSS_COMPILE=${CROSS_COMPILE_AARCH64} HOSTCC=gcc LD=${CROSS_COMPILE_AARCH64}ld HOSTLD=ld.bfd HOSTPYTHON=/usr/bin/python2 >> "$BUILD_LOG" 2>&1 || ( echo "MAKE FAILED, see $BUILD_LOG" && cat "$BUILD_LOG" && exit 1 )
+          make -j$(nproc) O=out ARCH=$ARCH CC=clang HOSTCC=gcc LD=${CROSS_COMPILE_AARCH64}ld HOSTLD=ld.bfd HOSTPYTHON=/usr/bin/python2 >> "$BUILD_LOG" 2>&1 || ( echo "MAKE FAILED, see $BUILD_LOG" && cat "$BUILD_LOG" && exit 1 )
           echo "=== END build $(date) ===" >> "$BUILD_LOG"
 
       - name: 立即备份并准备原始产物（未打包）
