@@ -73,31 +73,42 @@ jobs:
           echo "Running make O=out mrproper" >> "$LOG"
           make O=out mrproper >> "$LOG" 2>&1 || true
 
-          # 保守 git 清理（CI 中通常安全）
+          # 保守的 git 清理（CI 中通常安全）
           echo "Running git reset --hard" >> "$LOG"
           git reset --hard >> "$LOG" 2>&1 || true
           echo "Running git clean -fdx" >> "$LOG"
           git clean -fdx >> "$LOG" 2>&1 || true
 
-          # 恢复 .config 并生成 out/.config（如有备份）
+          # 恢复 .config 并生成 out/.config（如有备份），使用 non-interactive defaults
           if [ -f /tmp/config.backup ]; then
             mv /tmp/config.backup .config || true
-            echo "Restored .config and running make O=out olddefconfig" >> "$LOG"
-            make O=out olddefconfig >> "$LOG" 2>&1 || true
+            echo "Restored .config and running non-interactive olddefconfig" >> "$LOG"
+            yes "" | make O=out olddefconfig >> "$LOG" 2>&1 || true
           fi
 
-          # 修补 techpack/display/msm/Makefile：插入 ifndef 保护并注释 warning 行
+          # 修补 techpack/display/msm/Makefile：保守移除触发警告的行并在末尾追加 ifndef 块（不会破坏现有结构）
           MF="techpack/display/msm/Makefile"
           if [ -f "$MF" ]; then
             echo "Patching $MF" >> "$LOG"
-            # 插入保护定义（仅在未存在时）
-            grep -q "ifndef OPLUS_FEATURE_PXLW_IRIS5" "$MF" >> "$LOG" 2>&1 || sed -i '1iifndef OPLUS_FEATURE_PXLW_IRIS5\nOPLUS_FEATURE_PXLW_IRIS5 := y\nendif\n' "$MF"
-            grep -q "ifndef PXLW_IRIS_DUAL" "$MF" >> "$LOG" 2>&1 || sed -i '1iifndef PXLW_IRIS_DUAL\nPXLW_IRIS_DUAL := y\nendif\n' "$MF"
-            # 注释掉包含重复定义提示的 warning 行，避免构建中断噪音
-            sed -i '/Defined OPLUS_FEATURE_PXLW_IRIS5/ s/^/#/' "$MF" || true
-            sed -i '/PXLW_IRIS_DUAL/ s/^/#/' "$MF" || true
-            echo "Patched $MF head (first 60 lines):" >> "$LOG"
-            sed -n '1,60p' "$MF" >> "$LOG" 2>&1 || true
+            cp "$MF" "${MF}.bak" || true
+
+            # 删除包含重复定义提示的 warning 行（保守）
+            sed -i '/Defined OPLUS_FEATURE_PXLW_IRIS5/d' "$MF" || true
+            sed -i '/PXLW_IRIS_DUAL/d' "$MF" || true
+            sed -i '/\$(warning.*OPLUS_FEATURE_PXLW_IRIS5)/d' "$MF" || true
+            sed -i '/\$(warning.*PXLW_IRIS_DUAL)/d' "$MF" || true
+
+            # 在文件末尾追加保守的 ifndef 块（仅在不存在时追加）
+            if ! grep -q "ifndef OPLUS_FEATURE_PXLW_IRIS5" "$MF"; then
+              printf '\nifndef OPLUS_FEATURE_PXLW_IRIS5\nOPLUS_FEATURE_PXLW_IRIS5 := y\nendif\n' >> "$MF"
+            fi
+
+            if ! grep -q "ifndef PXLW_IRIS_DUAL" "$MF"; then
+              printf '\nifndef PXLW_IRIS_DUAL\nPXLW_IRIS_DUAL := y\nendif\n' >> "$MF"
+            fi
+
+            echo "Patched $MF tail (last 60 lines):" >> "$LOG"
+            tail -n 60 "$MF" >> "$LOG" 2>&1 || true
           else
             echo "$MF not found, skipping patch" >> "$LOG"
           fi
@@ -114,7 +125,7 @@ jobs:
           /tmp/sukisu-setup.sh ${SUKISU_MODE} >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || ( echo "SukiSU setup.sh failed, see setup.log" && exit 1 )
           echo "SukiSU setup completed" >> "$GITHUB_WORKSPACE/kernel/setup.log"
 
-      - name: 启用 Manual hook 的内核配置项
+      - name: 启用 Manual hook 的内核配置项（非交互）
         working-directory: kernel
         run: |
           set -e
@@ -124,14 +135,15 @@ jobs:
           scripts/config --file .config --enable CONFIG_KSU_MANUAL_HOOK || true
           # 可选：禁用 kprobes 避免冲突（按需取消注释）
           # scripts/config --file .config --disable CONFIG_KPROBES || true
-          make O=out ARCH=$ARCH olddefconfig >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || true
+          # 使用 non-interactive olddefconfig（避免交互）
+          yes "" | make O=out ARCH=$ARCH olddefconfig >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || true
           grep -E "KSU_MANUAL_HOOK|KPROBES" -n .config >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || true
 
-      - name: 准备 defconfig（若需要）
+      - name: 准备 defconfig（非交互）
         working-directory: kernel
         run: |
           export ARCH=${{ env.ARCH }}
-          make O=out ARCH=$ARCH ${DEFCONFIG} HOSTPYTHON=/usr/bin/python2 >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || true
+          yes "" | make O=out ARCH=$ARCH ${DEFCONFIG} HOSTPYTHON=/usr/bin/python2 >> "$GITHUB_WORKSPACE/kernel/setup.log" 2>&1 || true
 
       - name: 验证交叉链接器可用
         working-directory: kernel
