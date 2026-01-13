@@ -9,8 +9,8 @@ env:
   KERNEL_BRANCH: oss-t-sukisu
 
   # SukiSU 源（setup.sh 会根据参数切换到 builtin 分支）
-  SUKISU_SETUP_URL: https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh
-  SUKISU_SETUP_BRANCH_ARG: main
+  SUKISU_SETUP_URL: https://raw.githubusercontent.com/JackA1ltman/SukiSU-Ultra/builtin/kernel/setup.sh
+  SUKISU_SETUP_BRANCH_ARG: builtin
 
   # SUSFS（仅克隆，不合并）
   SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
