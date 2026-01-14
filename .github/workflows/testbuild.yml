@@ -10,7 +10,7 @@ env:
 
   # SukiSU 源（setup.sh 会根据参数切换到 builtin 分支）
   SUKISU_SETUP_URL: https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh
-  SUKISU_SETUP_BRANCH_ARG: dev
+  SUKISU_SETUP_BRANCH_ARG: legacy
 
   # SUSFS（仅克隆，不合并）
   SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
