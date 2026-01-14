@@ -1,0 +1,168 @@
+name: 构建内核并备份原始产物 PDEM10 (含 SukiSU)
+
+on:
+  workflow_dispatch:
+
+env:
+  # 内核仓库（你的内核源码）
+  KERNEL_REPO: https://github.com/Yun-Hydrogen/Oppo_Findx2_Sukisu_Kernel.git
+  KERNEL_BRANCH: oss-t-sukisu
+
+  # SukiSU 源（setup.sh 会根据参数切换到 builtin 分支）
+  SUKISU_SETUP_URL: https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh
+  SUKISU_SETUP_BRANCH_ARG: v0.9.5
+
+  # SUSFS（仅克隆，不合并）
+  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
+  SUSFS_BRANCH: kernel-4.19
+
+  # 工具链
+  CLANG_REPO: https://github.com/blacklytning/clang-13.0.1.git
+  CLANG_BRANCH: 11
+  GCC64_REPO: https://github.com/JackA1ltman/Google-GCC-Android-4.9.git
+  GCC64_BRANCH: aarch64
+  GCC32_REPO: https://github.com/JackA1ltman/Google-GCC-Android-4.9.git
+  GCC32_BRANCH: arm32
+
+  # AnyKernel3
+  AK3_SOURCE: https://github.com/osm0sis/AnyKernel3.git
+  AK3_BRANCH: master
+
+  # 构建配置（你已修改好）
+  DEFCONFIG: stock_defconfig
+  ARCH: arm64
+  DEVICE: PDEM10
+  CROSS_COMPILE_AARCH64: aarch64-linux-android-
+  CROSS_COMPILE_ARM: arm-linux-androideabi-
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装依赖并配置 python2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev libncurses-dev ccache python2 git wget zip unzip binutils
+          sudo ln -sf /usr/bin/python2 /usr/bin/python
+          python --version
+      - name: 恢复 clang 缓存
+        uses: actions/cache@v4
+        with:
+          path: clang
+          key: clang-${{ env.CLANG_BRANCH }}-${{ runner.os }}
+          restore-keys: |
+            clang-${{ env.CLANG_BRANCH }}-${{ runner.os }}-
+            clang-${{ runner.os }}-
+      - name: 恢复 gcc64 缓存
+        uses: actions/cache@v4
+        with:
+          path: gcc64
+          key: gcc64-${{ env.GCC64_BRANCH }}-${{ runner.os }}
+          restore-keys: |
+            gcc64-${{ env.GCC64_BRANCH }}-${{ runner.os }}-
+            gcc64-${{ runner.os }}-
+      - name: 恢复 gcc32 缓存
+        uses: actions/cache@v4
+        with:
+          path: gcc32
+          key: gcc32-${{ env.GCC32_BRANCH }}-${{ runner.os }}
+          restore-keys: |
+            gcc32-${{ env.GCC32_BRANCH }}-${{ runner.os }}-
+            gcc32-${{ runner.os }}-
+      - name: 克隆工具链（若缓存未命中）
+        run: |
+          [ -d clang ] || git clone --depth=1 --branch $CLANG_BRANCH $CLANG_REPO clang
+          [ -d gcc64 ] || git clone --depth=1 --branch $GCC64_BRANCH $GCC64_REPO gcc64
+          [ -d gcc32 ] || git clone --depth=1 --branch $GCC32_BRANCH $GCC32_REPO gcc32
+      - name: 克隆内核源码
+        run: |
+          rm -rf kernel
+          git clone --depth=1 --branch $KERNEL_BRANCH $KERNEL_REPO kernel
+      - name: 将 SukiSU 添加到内核源码树（使用 Buildin 分支）
+        working-directory: kernel
+        run: |
+          set -e
+          # 使用你提供的命令在 kernel 目录内执行 setup.sh 并传入 builtin 参数
+          curl -LSs "${SUKISU_SETUP_URL}" | bash -s $SUKISU_SETUP_BRANCH_ARG
+          # 列出变更以便调试
+          git status --porcelain || true
+          ls -la || true
+      - name: 克隆 SUSFS（仅备份，不合并到内核）
+        run: |
+          rm -rf susfs
+          git clone --depth=1 --branch $SUSFS_BRANCH $SUSFS_REPO susfs || true
+          echo "SUSFS cloned to $PWD/susfs (not merged into kernel)."
+          ls -la susfs || true
+      - name: 设置环境变量
+        run: |
+          echo "PATH=$PWD/clang/bin:$PWD/gcc64/bin:$PWD/gcc32/bin:$PATH" >> $GITHUB_ENV
+          echo "CROSS_COMPILE_AARCH64=${{ env.CROSS_COMPILE_AARCH64 }}" >> $GITHUB_ENV
+          echo "CROSS_COMPILE_ARM=${{ env.CROSS_COMPILE_ARM }}" >> $GITHUB_ENV
+          echo "HOSTPYTHON=/usr/bin/python2" >> $GITHUB_ENV
+          echo "PYTHON=/usr/bin/python2" >> $GITHUB_ENV
+      - name: 准备 defconfig
+        working-directory: kernel
+        run: |
+          export ARCH=${{ env.ARCH }}
+          make O=out ARCH=$ARCH ${DEFCONFIG} HOSTPYTHON=/usr/bin/python2
+      - name: 编译内核（Clang + GCC，使用交叉 ld）
+        working-directory: kernel
+        run: |
+          set -e
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$GITHUB_WORKSPACE/gcc64/bin:$GITHUB_WORKSPACE/gcc32/bin:$PATH
+          export HOSTPYTHON=/usr/bin/python2
+          export PYTHON=/usr/bin/python2
+          export CROSS_COMPILE=${CROSS_COMPILE_AARCH64}
+          export CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM}
+          make -j$(nproc) O=out ARCH=$ARCH CC=clang HOSTCC=gcc LD=${CROSS_COMPILE_AARCH64}ld HOSTLD=ld.bfd HOSTPYTHON=/usr/bin/python2
+      - name: 立即备份并上传原始产物
+        if: success()
+        working-directory: kernel
+        run: |
+          RAW_DIR="$GITHUB_WORKSPACE/raw_artifacts"
+          mkdir -p "$RAW_DIR"
+          cp -v out/arch/arm64/boot/Image* "$RAW_DIR/" 2>/dev/null || true
+          cp -v out/System.map "$RAW_DIR/" 2>/dev/null || true
+          if [ -d out/lib/modules ]; then
+            mkdir -p "$RAW_DIR/modules"
+            cp -r out/lib/modules/* "$RAW_DIR/modules/" || true
+          fi
+          # 记录 SukiSU 相关文件（若存在）
+          if [ -d suki-su ] || [ -d out/sukisu ] || ls out | grep -i suki || true; then
+            echo "SukiSU related files may exist in the tree; listing out/ and kernel/ for debug:"
+            ls -la out || true
+            ls -la kernel || true
+          fi
+          ls -la "$RAW_DIR" || true
+      - name: 上传原始产物
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-${{ env.DEVICE }}
+          path: raw_artifacts
+
+      - name: 打包 AnyKernel3（修改 anykernel.sh）
+        if: success()
+        working-directory: kernel
+        run: |
+          git clone --depth=1 --branch $AK3_BRANCH $AK3_SOURCE AnyKernel3
+          mkdir -p AnyKernel3/kernel
+          cp -r $GITHUB_WORKSPACE/raw_artifacts/* AnyKernel3/kernel/ || true
+          # 修改 anykernel.sh 属性
+          sed -i 's/^kernel.string=.*/kernel.string="PDEM10 Kernel by Hydrogen"/' AnyKernel3/anykernel.sh || echo 'kernel.string="PDEM10 Kernel by Hydrogen"' >> AnyKernel3/anykernel.sh
+          sed -i 's/^device.name1=.*/device.name1=PDEM10/' AnyKernel3/anykernel.sh || echo 'device.name1=PDEM10' >> AnyKernel3/anykernel.sh
+          sed -i 's/^BLOCK=.*/BLOCK=auto/' AnyKernel3/anykernel.sh || echo 'BLOCK=auto' >> AnyKernel3/anykernel.sh
+          sed -i 's/^IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto/' AnyKernel3/anykernel.sh || echo 'IS_SLOT_DEVICE=auto' >> AnyKernel3/anykernel.sh
+          cd AnyKernel3
+          OUT_ZIP="$GITHUB_WORKSPACE/${DEVICE}-kernel.zip"
+          zip -r "$OUT_ZIP" . -x ".git/*" "README.md" "*placeholder"
+          ls -lah "$OUT_ZIP" || true
+      - name: 上传打包产物
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DEVICE }}-kernel
+          path: ${{ env.DEVICE }}-kernel.zip
