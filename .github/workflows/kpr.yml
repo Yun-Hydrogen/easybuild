@@ -1,4 +1,4 @@
-name: 构建内核并备份原始产物 PDEM10 (含 SukiSU)
+name: 构建内核并备份原始产物 PDEM10 KPR集成
 
 on:
   workflow_dispatch:
